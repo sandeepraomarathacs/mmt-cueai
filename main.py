@@ -9,8 +9,6 @@ import io
 import json
 import logging
 import os
-import re
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,13 +51,11 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 LARAVEL_API_URL = os.getenv("LARAVEL_API_URL", "http://127.0.0.1:8000").rstrip("/")
 RPM_LIMIT = int(os.getenv("RPM_LIMIT", "10"))
 SAMPLE_RATE = 16000
-# Simple live-mic controls
-SPEECH_RMS_THRESHOLD = float(os.getenv("SPEECH_RMS_THRESHOLD", "0.012"))
-SPEECH_MIN_RATIO = float(os.getenv("SPEECH_MIN_RATIO", "0.08"))
-AUDIO_WINDOW_SEC = int(os.getenv("AUDIO_WINDOW_SEC", "14"))
-KEEP_AUDIO_SEC = int(os.getenv("KEEP_AUDIO_SEC", "4"))
-# After an answer is shown, keep it stable this many seconds (lets user speak it).
-ANSWER_HOLD_SEC = float(os.getenv("ANSWER_HOLD_SEC", "18"))
+# Push-to-talk mic: record while ON, answer once on STOP
+SPEECH_RMS_THRESHOLD = float(os.getenv("SPEECH_RMS_THRESHOLD", "0.008"))
+SPEECH_MIN_RATIO = float(os.getenv("SPEECH_MIN_RATIO", "0.05"))
+# Max recording length kept in memory (~10 minutes PCM16 mono)
+MAX_RECORD_SEC = int(os.getenv("MAX_RECORD_SEC", "600"))
 
 if REQUIRE_API_KEY and not API_SECRET_KEY:
     raise RuntimeError("API_SECRET_KEY is required when REQUIRE_API_KEY=true")
@@ -161,6 +157,23 @@ def audio_to_wav_bytes(audio: np.ndarray, rate: int = SAMPLE_RATE) -> bytes:
     return buf.getvalue()
 
 
+def audio_to_gemini_bytes(audio: np.ndarray, rate: int = SAMPLE_RATE) -> Tuple[bytes, str]:
+    """Prefer FLAC (smaller/faster than WAV) like hnr-doctor path."""
+    if audio.size == 0:
+        return b"", "audio/wav"
+    try:
+        import soundfile as sf
+
+        buf = io.BytesIO()
+        sf.write(buf, np.clip(audio, -1.0, 1.0).astype(np.float32), rate, format="FLAC")
+        data = buf.getvalue()
+        if data:
+            return data, "audio/flac"
+    except Exception:
+        log.warning("FLAC compress failed; using WAV")
+    return audio_to_wav_bytes(audio, rate), "audio/wav"
+
+
 def pcm16_bytes_to_float(pcm: bytes) -> np.ndarray:
     if not pcm:
         return np.zeros(0, dtype=np.float32)
@@ -187,26 +200,6 @@ def speech_stats(audio: np.ndarray, frame_ms: int = 30) -> Tuple[float, float]:
 def has_enough_speech(audio: np.ndarray) -> bool:
     rms, ratio = speech_stats(audio)
     return rms >= SPEECH_RMS_THRESHOLD and ratio >= SPEECH_MIN_RATIO
-
-
-def answer_fingerprint(answer: str, limit: int = 420) -> str:
-    clean = re.sub(r"\s+", " ", (answer or "").strip())
-    return clean[:limit]
-
-
-def answers_similar(a: str, b: str) -> bool:
-    fa = answer_fingerprint(a, 500).lower()
-    fb = answer_fingerprint(b, 500).lower()
-    if not fa or not fb:
-        return False
-    if fa == fb:
-        return True
-    # crude overlap on words — avoid tiny wording-only refreshes
-    wa = set(re.findall(r"[a-z0-9]+", fa))
-    wb = set(re.findall(r"[a-z0-9]+", fb))
-    if not wa or not wb:
-        return False
-    return (len(wa & wb) / max(len(wa), len(wb))) >= 0.82
 
 
 async def gemini_generate(
@@ -354,13 +347,11 @@ async def ask_screen(
 @app.websocket("/ws/audio")
 async def websocket_audio(ws: WebSocket):
     """
-    Simple live mic:
-      - continuous audio stream
-      - periodic process => answer
-      - after an answer, HOLD it for ANSWER_HOLD_SEC (stable while user speaks)
-      - then auto-update again for the next question
+    Push-to-talk (hnr-doctor style):
+      mic START  -> only buffer audio (no Gemini)
+      mic STOP   -> process full recording once -> answer
     Protocol:
-      start | binary PCM | process | refresh | stop
+      start | binary PCM16 | stop
     """
     if not await authorize_websocket(ws, API_SECRET_KEY, REQUIRE_API_KEY):
         log.warning("ws unauthorized")
@@ -372,63 +363,36 @@ async def websocket_audio(ws: WebSocket):
     context: Optional[str] = None
     buffer = bytearray()
     processing = False
-    current_answer: Optional[str] = None
-    answered_at = 0.0
     log.info("ws connected")
 
-    def trim_buffer(keep_sec: int = KEEP_AUDIO_SEC) -> None:
-        keep = SAMPLE_RATE * 2 * max(1, keep_sec)
-        if len(buffer) > keep:
-            del buffer[:-keep]
-
-    def window_audio() -> np.ndarray:
-        max_bytes = SAMPLE_RATE * 2 * max(6, AUDIO_WINDOW_SEC)
-        chunk = bytes(buffer[-max_bytes:]) if len(buffer) > max_bytes else bytes(buffer)
-        return pcm16_bytes_to_float(chunk)
-
-    async def process_buffer(final: bool = False, force: bool = False) -> None:
-        nonlocal processing, current_answer, answered_at
+    async def answer_from_recording() -> None:
+        nonlocal processing, buffer
         if processing:
             await ws.send_json({"type": "info", "message": "already processing"})
             return
-        if len(buffer) < SAMPLE_RATE:
-            await ws.send_json({"type": "info", "message": "not enough audio yet"})
-            return
-
-        # Keep current answer stable for a short hold window (user speaking time).
-        if (
-            not force
-            and not final
-            and current_answer
-            and (time.monotonic() - answered_at) < ANSWER_HOLD_SEC
-        ):
-            remain = max(0, int(ANSWER_HOLD_SEC - (time.monotonic() - answered_at)))
+        if len(buffer) < SAMPLE_RATE // 2:
             await ws.send_json(
                 {
                     "type": "turn_status",
-                    "state": "stable",
-                    "reason": "hold",
-                    "answer_stable": True,
-                    "message": f"answer stable ({remain}s)",
+                    "state": "ready",
+                    "reason": "empty",
+                    "message": "no audio captured",
                 }
             )
             return
 
         processing = True
         try:
-            audio = window_audio()
-            if not force and not has_enough_speech(audio):
+            audio = pcm16_bytes_to_float(bytes(buffer))
+            if not has_enough_speech(audio):
                 await ws.send_json(
                     {
                         "type": "turn_status",
-                        "state": "listening",
+                        "state": "ready",
                         "reason": "silence",
-                        "answer_stable": bool(current_answer),
-                        "message": "listening…",
+                        "message": "no clear speech — try again",
                     }
                 )
-                if not final:
-                    trim_buffer()
                 return
 
             await ws.send_json(
@@ -436,30 +400,25 @@ async def websocket_audio(ws: WebSocket):
                     "type": "turn_status",
                     "state": "processing",
                     "reason": "generating",
-                    "answer_stable": False,
                     "message": "thinking…",
                 }
             )
 
             system = system_prompt(mode, language, context)
             prompt = (
-                "This is a live call audio chunk. Detect the latest interviewer question "
-                "and provide a concise real-time answer the user can speak. "
-                "Ignore the candidate reading/paraphrasing a previous answer."
+                "This recording is one interview/call segment captured while the mic was on.\n"
+                "Find the main question or prompt from the other person and give a concise "
+                "spoken-style answer the candidate can use.\n"
+                "Prefer the latest clear question if there are multiple.\n"
+                "Ignore filler, silence, and side talk that is not a question."
             )
-            if current_answer:
-                prompt += (
-                    "\nPrevious answer fingerprint:\n"
-                    f"{answer_fingerprint(current_answer, 220)}\n"
-                )
-
-            wav = audio_to_wav_bytes(audio)
+            audio_bytes, audio_mime = audio_to_gemini_bytes(audio)
             answer = await gemini_generate(
                 prompt=prompt,
                 system=system,
-                audio_bytes=wav,
-                audio_mime="audio/wav",
-                temperature=0.35,
+                audio_bytes=audio_bytes,
+                audio_mime=audio_mime,
+                temperature=0.3,
                 max_output_tokens=900,
             )
             answer = (answer or "").strip()
@@ -467,55 +426,33 @@ async def websocket_audio(ws: WebSocket):
                 await ws.send_json(
                     {
                         "type": "turn_status",
-                        "state": "listening",
-                        "reason": "empty",
-                        "answer_stable": bool(current_answer),
-                        "message": "listening…",
+                        "state": "ready",
+                        "reason": "empty_answer",
+                        "message": "no answer produced",
                     }
                 )
-                if not final:
-                    trim_buffer()
                 return
 
-            # Don't flicker UI with near-identical rewrites.
-            if current_answer and answers_similar(current_answer, answer) and not force:
-                answered_at = time.monotonic()
-                await ws.send_json(
-                    {
-                        "type": "turn_status",
-                        "state": "stable",
-                        "reason": "same_answer",
-                        "answer_stable": True,
-                        "message": "answer stable",
-                    }
-                )
-                if not final:
-                    trim_buffer()
-                return
-
-            current_answer = answer
-            answered_at = time.monotonic()
             payload = make_answer(answer, mode)
             payload.update(
                 {
                     "type": "answer",
-                    "final": final,
+                    "final": True,
                     "locked": True,
-                    "state": "stable",
-                    "reason": "auto" if not force else "refresh",
+                    "state": "ready",
+                    "reason": "mic_stop",
                 }
             )
             await ws.send_json(payload)
-            if not final:
-                trim_buffer()
+            buffer.clear()
         except Exception:
-            log.exception("ws process failed")
+            log.exception("ws stop process failed")
             await ws.send_json({"type": "error", "message": "processing failed"})
         finally:
             processing = False
 
     try:
-        await ws.send_json({"type": "ready", "features": ["hold", "vad"]})
+        await ws.send_json({"type": "ready", "features": ["push_to_talk", "flac"]})
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -523,7 +460,7 @@ async def websocket_audio(ws: WebSocket):
 
             if message.get("bytes") is not None:
                 buffer.extend(message["bytes"])
-                max_buf = SAMPLE_RATE * 2 * 45
+                max_buf = SAMPLE_RATE * 2 * max(60, MAX_RECORD_SEC)
                 if len(buffer) > max_buf:
                     del buffer[:-max_buf]
                 continue
@@ -544,32 +481,23 @@ async def websocket_audio(ws: WebSocket):
                 language = data.get("language") or language
                 context = data.get("context") or context
                 buffer.clear()
-                current_answer = None
-                answered_at = 0.0
-                await ws.send_json({"type": "started", "mode": mode, "state": "listening"})
+                await ws.send_json({"type": "started", "mode": mode, "state": "recording"})
             elif msg_type == "context":
                 context = data.get("context") or context
                 await ws.send_json({"type": "ok"})
-            elif msg_type == "process":
-                await process_buffer(final=False, force=False)
-            elif msg_type in {"refresh", "answer_now"}:
-                await process_buffer(final=False, force=True)
-            elif msg_type == "unlock":
-                # Compatibility no-op for older clients
-                answered_at = 0.0
+            elif msg_type in {"process", "refresh", "answer_now", "unlock"}:
+                # Mid-recording process disabled — answer only on stop.
                 await ws.send_json(
                     {
                         "type": "turn_status",
-                        "state": "listening",
-                        "reason": "unlock",
-                        "answer_stable": bool(current_answer),
-                        "message": "listening…",
+                        "state": "recording",
+                        "reason": "record_only",
+                        "message": "recording… stop mic for answer",
                     }
                 )
             elif msg_type == "stop":
-                if current_answer is None:
-                    await process_buffer(final=True, force=True)
-                await ws.send_json({"type": "stopped", "state": "stopped"})
+                await answer_from_recording()
+                await ws.send_json({"type": "stopped", "state": "ready"})
                 break
             else:
                 await ws.send_json({"type": "error", "message": f"unknown type {msg_type}"})
