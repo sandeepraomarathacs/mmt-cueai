@@ -267,7 +267,8 @@ class SessionController extends Controller
 
         return response()->json([
             'ws_url' => $connectedUrl,
-            'chunk_process_seconds' => 12,
+            // Slightly faster cadence; server VAD + turn-lock skips most expensive calls.
+            'chunk_process_seconds' => 10,
             'sample_rate' => 16000,
         ]);
     }
