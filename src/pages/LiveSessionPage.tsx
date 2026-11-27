@@ -1,9 +1,23 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, Message, Session } from '../api'
-import { LiveAudioSocket } from '../audioWs'
+import { LiveAudioSocket, TurnState } from '../audioWs'
 import AnswerMarkdown from '../components/AnswerMarkdown'
 import DragRegion from '../components/DragRegion'
+
+function turnLabel(recording: boolean, busy: boolean, turnState: TurnState | string, turnReason: string) {
+  if (busy && !recording) return 'processing…'
+  if (!recording) return 'ready'
+  if (turnState === 'processing') return 'thinking…'
+  if (turnState === 'locked') {
+    if (turnReason === 'candidate_answer') return 'locked · you speaking'
+    if (turnReason === 'classifying') return 'locked · checking turn'
+    if (turnReason === 'cooldown') return 'locked · stable'
+    return 'locked · answer ready'
+  }
+  if (turnState === 'waiting') return 'waiting for next question'
+  return 'listening for question'
+}
 
 function base64ToBlob(base64: string, mime = 'image/png'): Blob {
   const bin = atob(base64)
@@ -28,8 +42,12 @@ export default function LiveSessionPage() {
   const [opacity, setOpacity] = useState(0.92)
   const [clickThrough, setClickThrough] = useState(false)
   const [stealth, setStealth] = useState(true)
+  const [turnState, setTurnState] = useState<TurnState | string>('listening')
+  const [turnReason, setTurnReason] = useState('')
+  const [turnMessage, setTurnMessage] = useState('')
   const liveAudioRef = useRef<LiveAudioSocket | null>(null)
   const askRef = useRef<HTMLTextAreaElement | null>(null)
+  const lastSavedAnswerRef = useRef('')
 
   async function load() {
     const s = await api.getSession(sessionId)
@@ -79,6 +97,9 @@ export default function LiveSessionPage() {
       } finally {
         liveAudioRef.current = null
         setRecording(false)
+        setTurnState('stopped')
+        setTurnReason('')
+        setTurnMessage('')
         setBusy(false)
       }
       return
@@ -87,6 +108,10 @@ export default function LiveSessionPage() {
     try {
       setError('')
       setBusy(true)
+      setTurnState('listening')
+      setTurnReason('')
+      setTurnMessage('listening for question')
+      lastSavedAnswerRef.current = ''
       const cfg = await api.realtimeConfig()
       const socket = new LiveAudioSocket(
         cfg.ws_url,
@@ -97,20 +122,33 @@ export default function LiveSessionPage() {
         {
           onAnswer: (payload) => {
             if (!payload.answer) return
+            // Only replace when server emits a real new answer (turn unlock / first answer).
             setAnswer(payload.answer)
-            void api.storeMessage(sessionId, {
-              channel: 'voice',
-              input: '[live audio chunk]',
-              answer: payload.answer,
-            }).then((message) => {
-              setMessages((prev) => [message, ...prev])
-            }).catch(() => {
-              // still show answer even if history save fails
-            })
+            setTurnState(payload.state || 'locked')
+            setTurnReason(payload.reason || 'new_answer')
+            setTurnMessage('answer locked — speak freely')
+            if (payload.answer !== lastSavedAnswerRef.current) {
+              lastSavedAnswerRef.current = payload.answer
+              void api.storeMessage(sessionId, {
+                channel: 'voice',
+                input: payload.reason === 'new_question' ? '[new question]' : '[live audio]',
+                answer: payload.answer,
+              }).then((message) => {
+                setMessages((prev) => [message, ...prev])
+              }).catch(() => {
+                // still show answer even if history save fails
+              })
+            }
+          },
+          onTurnStatus: (payload) => {
+            setTurnState(payload.state)
+            setTurnReason(payload.reason || '')
+            if (payload.message) setTurnMessage(payload.message)
+            // Never clear/replace answer on stable/skip statuses.
           },
           onError: (message) => setError(message),
         },
-        cfg.chunk_process_seconds || 12,
+        cfg.chunk_process_seconds || 10,
       )
       await socket.start()
       liveAudioRef.current = socket
@@ -120,6 +158,7 @@ export default function LiveSessionPage() {
       await liveAudioRef.current?.stop(false).catch(() => {})
       liveAudioRef.current = null
       setRecording(false)
+      setTurnState('stopped')
     } finally {
       setBusy(false)
     }
@@ -184,7 +223,9 @@ export default function LiveSessionPage() {
         <DragRegion className="titlebar">
           <div style={{ minWidth: 0 }}>
             <h1>{session?.title || 'Live session'}</h1>
-            <div className="muted">{session?.mode} · {busy ? 'processing…' : recording ? 'listening' : 'ready'}</div>
+            <div className="muted">
+              {session?.mode} · {turnLabel(recording, busy, turnState, turnReason)}
+            </div>
           </div>
           <div className="no-drag" style={{ display: 'flex', gap: 6 }}>
             <button
@@ -224,6 +265,25 @@ export default function LiveSessionPage() {
             <button className={`chip ${recording ? 'on' : ''}`} onClick={() => void toggleMic()} disabled={busy}>
               {recording ? 'Stop live mic' : 'Live mic (WS)'}
             </button>
+            {recording && (
+              <>
+                <button
+                  className={`chip ${turnState === 'locked' ? 'lock' : ''}`}
+                  title="Unlock so the next speech can create a new answer"
+                  onClick={() => liveAudioRef.current?.unlock()}
+                >
+                  Unlock
+                </button>
+                <button
+                  className="chip"
+                  title="Force a new answer from current audio"
+                  onClick={() => liveAudioRef.current?.refresh()}
+                  disabled={busy}
+                >
+                  New answer
+                </button>
+              </>
+            )}
             <button className="chip" onClick={() => void captureScreen()} disabled={busy}>Screen</button>
             <button className={`chip ${showAsk ? 'on' : ''}`} onClick={() => setShowAsk((v) => !v)}>Ask</button>
             <button
@@ -266,7 +326,16 @@ export default function LiveSessionPage() {
 
         {error && <div className="error no-drag">{error}</div>}
 
-        <div className="answer-box no-drag">
+        {recording && (
+          <div className="turn-bar no-drag">
+            <span className={`turn-pill ${turnState === 'locked' ? 'locked' : turnState === 'processing' ? 'busy' : 'live'}`}>
+              {turnState === 'locked' ? 'LOCKED' : turnState === 'processing' ? 'THINKING' : 'LIVE'}
+            </span>
+            <span className="muted">{turnMessage || turnLabel(true, busy, turnState, turnReason)}</span>
+          </div>
+        )}
+
+        <div className={`answer-box no-drag ${recording && turnState === 'locked' ? 'answer-locked' : ''}`}>
           {answer ? (
             <AnswerMarkdown content={answer} />
           ) : (
