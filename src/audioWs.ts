@@ -1,8 +1,11 @@
 /**
  * Live mic → Python /ws/audio as PCM16 mono chunks.
- * Server uses VAD + turn-lock so answers stay stable while the candidate speaks.
+ *
+ * Best UX: keep mic ON (buffering). Press Answer now when interviewer
+ * finishes a question. Auto silence-turn can also fire, but Answer now
+ * is the reliable path — no need to stop/start mic each question.
  */
-export type TurnState = 'listening' | 'locked' | 'waiting' | 'processing' | 'stopped'
+export type TurnState = 'listening' | 'locked' | 'armed' | 'waiting' | 'processing' | 'stopped'
 
 export type AudioWsHandlers = {
   onAnswer?: (payload: {
@@ -53,15 +56,16 @@ export class LiveAudioSocket {
   private processTimer: number | null = null
   private readonly targetRate = 16000
   private turnState: TurnState | string = 'listening'
-  private baseProcessEverySec: number
+  /** Cheap VAD tick interval (server skips Gemini unless utterance ends / answer_now). */
+  private readonly tickEverySec: number
 
   constructor(
     private readonly wsUrl: string,
     private readonly meta: { mode: string; language?: string; context?: string },
     private readonly handlers: AudioWsHandlers,
-    processEverySec = 10,
+    tickEverySec = 2.5,
   ) {
-    this.baseProcessEverySec = Math.max(5, processEverySec)
+    this.tickEverySec = Math.max(1.5, tickEverySec)
   }
 
   get state() {
@@ -92,7 +96,6 @@ export class LiveAudioSocket {
             reason: msg.reason,
             state: msg.state,
           })
-          this.restartProcessTimer()
         } else if (msg.type === 'turn_status') {
           if (msg.state) this.turnState = msg.state
           this.handlers.onTurnStatus?.({
@@ -102,7 +105,6 @@ export class LiveAudioSocket {
             message: msg.message,
             confidence: typeof msg.confidence === 'number' ? msg.confidence : undefined,
           })
-          this.restartProcessTimer()
         } else if (msg.type === 'error') {
           this.handlers.onError?.(msg.message || 'WS error')
         } else if (msg.type === 'info' || msg.type === 'ready' || msg.type === 'started' || msg.type === 'stopped') {
@@ -131,7 +133,6 @@ export class LiveAudioSocket {
 
     this.audioCtx = new AudioContext()
     this.source = this.audioCtx.createMediaStreamSource(this.stream)
-    // ScriptProcessor is deprecated but widely available in Electron without worklet bundling
     this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1)
     this.processor.onaudioprocess = (e) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
@@ -142,44 +143,33 @@ export class LiveAudioSocket {
     this.source.connect(this.processor)
     this.processor.connect(this.audioCtx.destination)
 
-    this.restartProcessTimer()
+    // Frequent cheap ticks for silence-turn auto; Gemini only when utterance completes.
+    this.processTimer = window.setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'process' }))
+      }
+    }, Math.round(this.tickEverySec * 1000))
+
     this.handlers.onStatus?.('listening')
   }
 
-  /** Manual unlock — next speech can create a fresh answer. */
+  /** Manual unlock — arm for next question without regenerating. */
   unlock() {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'unlock' }))
     }
   }
 
-  /** Force regenerate from current audio window. */
-  refresh() {
+  /** Reliable: generate answer from recent buffered audio (mic stays on). */
+  answerNow() {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'refresh' }))
+      this.ws.send(JSON.stringify({ type: 'answer_now' }))
     }
   }
 
-  private processIntervalSec() {
-    // While locked, check turns a bit more often (gate is cheap / often skipped by VAD).
-    if (this.turnState === 'locked' || this.turnState === 'waiting') {
-      return Math.max(6, Math.min(this.baseProcessEverySec, 8))
-    }
-    return this.baseProcessEverySec
-  }
-
-  private restartProcessTimer() {
-    if (this.processTimer) {
-      clearInterval(this.processTimer)
-      this.processTimer = null
-    }
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-    const everyMs = this.processIntervalSec() * 1000
-    this.processTimer = window.setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'process' }))
-      }
-    }, everyMs)
+  /** Alias kept for older UI. */
+  refresh() {
+    this.answerNow()
   }
 
   async stop(finalProcess = true) {

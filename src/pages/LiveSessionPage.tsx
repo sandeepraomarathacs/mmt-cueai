@@ -10,13 +10,12 @@ function turnLabel(recording: boolean, busy: boolean, turnState: TurnState | str
   if (!recording) return 'ready'
   if (turnState === 'processing') return 'thinking…'
   if (turnState === 'locked') {
-    if (turnReason === 'candidate_answer') return 'locked · you speaking'
-    if (turnReason === 'classifying') return 'locked · checking turn'
-    if (turnReason === 'cooldown') return 'locked · stable'
+    if (turnReason === 'candidate_window') return 'locked · speak your answer'
     return 'locked · answer ready'
   }
-  if (turnState === 'waiting') return 'waiting for next question'
-  return 'listening for question'
+  if (turnState === 'armed') return 'ready for next question'
+  if (turnState === 'waiting') return 'waiting…'
+  return 'listening · press Answer now after question'
 }
 
 function base64ToBlob(base64: string, mime = 'image/png'): Blob {
@@ -110,7 +109,7 @@ export default function LiveSessionPage() {
       setBusy(true)
       setTurnState('listening')
       setTurnReason('')
-      setTurnMessage('listening for question')
+      setTurnMessage('mic on — press Answer now after each question')
       lastSavedAnswerRef.current = ''
       const cfg = await api.realtimeConfig()
       const socket = new LiveAudioSocket(
@@ -122,16 +121,16 @@ export default function LiveSessionPage() {
         {
           onAnswer: (payload) => {
             if (!payload.answer) return
-            // Only replace when server emits a real new answer (turn unlock / first answer).
+            // Only replace when server emits a real new answer.
             setAnswer(payload.answer)
             setTurnState(payload.state || 'locked')
             setTurnReason(payload.reason || 'new_answer')
-            setTurnMessage('answer locked — speak freely')
+            setTurnMessage('answer ready — speak it, then wait / press Answer now')
             if (payload.answer !== lastSavedAnswerRef.current) {
               lastSavedAnswerRef.current = payload.answer
               void api.storeMessage(sessionId, {
                 channel: 'voice',
-                input: payload.reason === 'new_question' ? '[new question]' : '[live audio]',
+                input: '[answer_now / utterance]',
                 answer: payload.answer,
               }).then((message) => {
                 setMessages((prev) => [message, ...prev])
@@ -144,11 +143,10 @@ export default function LiveSessionPage() {
             setTurnState(payload.state)
             setTurnReason(payload.reason || '')
             if (payload.message) setTurnMessage(payload.message)
-            // Never clear/replace answer on stable/skip statuses.
           },
           onError: (message) => setError(message),
         },
-        cfg.chunk_process_seconds || 10,
+        2.5,
       )
       await socket.start()
       liveAudioRef.current = socket
@@ -182,6 +180,13 @@ export default function LiveSessionPage() {
       }
       if (payload.action === 'capture-screen') void captureScreen()
       if (payload.action === 'toggle-mic') void toggleMic()
+      if (payload.action === 'answer-now') {
+        if (liveAudioRef.current) {
+          setTurnState('processing')
+          setTurnMessage('generating answer…')
+          liveAudioRef.current.answerNow()
+        }
+      }
     })
     const offOpacity = desktop.onOpacity((payload) => setOpacity(payload.value))
     const offClick = desktop.onClickThrough((payload) => setClickThrough(payload.enabled))
@@ -268,19 +273,23 @@ export default function LiveSessionPage() {
             {recording && (
               <>
                 <button
-                  className={`chip ${turnState === 'locked' ? 'lock' : ''}`}
-                  title="Unlock so the next speech can create a new answer"
-                  onClick={() => liveAudioRef.current?.unlock()}
+                  className="chip on"
+                  title="Generate answer from recent audio (Ctrl+Shift+G). Mic stays on."
+                  onClick={() => {
+                    setTurnState('processing')
+                    setTurnMessage('generating answer…')
+                    liveAudioRef.current?.answerNow()
+                  }}
+                  disabled={turnState === 'processing'}
                 >
-                  Unlock
+                  Answer now
                 </button>
                 <button
-                  className="chip"
-                  title="Force a new answer from current audio"
-                  onClick={() => liveAudioRef.current?.refresh()}
-                  disabled={busy}
+                  className={`chip ${turnState === 'armed' ? 'lock' : ''}`}
+                  title="Skip waiting — arm listening for the next question"
+                  onClick={() => liveAudioRef.current?.unlock()}
                 >
-                  New answer
+                  Next Q
                 </button>
               </>
             )}
@@ -328,10 +337,39 @@ export default function LiveSessionPage() {
 
         {recording && (
           <div className="turn-bar no-drag">
-            <span className={`turn-pill ${turnState === 'locked' ? 'locked' : turnState === 'processing' ? 'busy' : 'live'}`}>
-              {turnState === 'locked' ? 'LOCKED' : turnState === 'processing' ? 'THINKING' : 'LIVE'}
+            <span
+              className={`turn-pill ${
+                turnState === 'locked'
+                  ? 'locked'
+                  : turnState === 'processing'
+                    ? 'busy'
+                    : turnState === 'armed'
+                      ? 'live'
+                      : 'live'
+              }`}
+            >
+              {turnState === 'locked'
+                ? 'LOCKED'
+                : turnState === 'processing'
+                  ? 'THINKING'
+                  : turnState === 'armed'
+                    ? 'ARMED'
+                    : 'LIVE'}
             </span>
             <span className="muted">{turnMessage || turnLabel(true, busy, turnState, turnReason)}</span>
+            <button
+              className="chip on"
+              style={{ marginLeft: 'auto' }}
+              title="Ctrl+Shift+G"
+              onClick={() => {
+                setTurnState('processing')
+                setTurnMessage('generating answer…')
+                liveAudioRef.current?.answerNow()
+              }}
+              disabled={turnState === 'processing'}
+            >
+              Answer now
+            </button>
           </div>
         )}
 
@@ -382,7 +420,7 @@ export default function LiveSessionPage() {
         )}
 
         <DragRegion className="hint-bar">
-          Drag top bar · Space hide · P stealth · T toolbar · H history · M mic · S screen
+          Drag · Space hide · M mic · G answer now · S screen · T toolbar
           {stealth ? ' · stealth ON' : ' · stealth OFF'}
           {clickThrough ? ' · click-through' : ''}
         </DragRegion>

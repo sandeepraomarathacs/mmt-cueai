@@ -164,6 +164,7 @@ function registerShortcuts() {
     'CommandOrControl+Shift+A': () => send('shortcut', { action: 'focus-ask' }),
     'CommandOrControl+Shift+S': () => send('shortcut', { action: 'capture-screen' }),
     'CommandOrControl+Shift+M': () => send('shortcut', { action: 'toggle-mic' }),
+    'CommandOrControl+Shift+G': () => send('shortcut', { action: 'answer-now' }),
     'CommandOrControl+Shift+Up': () => {
       currentOpacity = Math.min(1, +(currentOpacity + 0.05).toFixed(2))
       if (mainWindow) mainWindow.setOpacity(currentOpacity)
