@@ -1,8 +1,9 @@
 /**
- * Live mic → Python /ws/audio as PCM16 mono chunks.
- * Simple continuous listening; server holds answers stable for a short window.
+ * Push-to-talk mic:
+ *  - start: stream PCM only (no mid-recording AI calls)
+ *  - stop: server answers once from full recording, then socket closes
  */
-export type TurnState = 'listening' | 'processing' | 'stable' | 'stopped'
+export type TurnState = 'recording' | 'processing' | 'ready' | 'stopped'
 
 export type AudioWsHandlers = {
   onAnswer?: (payload: {
@@ -15,7 +16,6 @@ export type AudioWsHandlers = {
   onTurnStatus?: (payload: {
     state: TurnState | string
     reason?: string
-    answer_stable?: boolean
     message?: string
   }) => void
   onError?: (message: string) => void
@@ -49,14 +49,13 @@ export class LiveAudioSocket {
   private audioCtx: AudioContext | null = null
   private processor: ScriptProcessorNode | null = null
   private source: MediaStreamAudioSourceNode | null = null
-  private processTimer: number | null = null
   private readonly targetRate = 16000
+  private stopWaiters: Array<() => void> = []
 
   constructor(
     private readonly wsUrl: string,
     private readonly meta: { mode: string; language?: string; context?: string },
     private readonly handlers: AudioWsHandlers,
-    private readonly processEverySec = 10,
   ) {}
 
   async start() {
@@ -84,14 +83,17 @@ export class LiveAudioSocket {
           })
         } else if (msg.type === 'turn_status') {
           this.handlers.onTurnStatus?.({
-            state: msg.state || 'listening',
+            state: msg.state || 'recording',
             reason: msg.reason,
-            answer_stable: !!msg.answer_stable,
             message: msg.message,
           })
         } else if (msg.type === 'error') {
           this.handlers.onError?.(msg.message || 'WS error')
-        } else if (msg.type === 'info' || msg.type === 'ready' || msg.type === 'started' || msg.type === 'stopped') {
+          this.resolveStopWaiters()
+        } else if (msg.type === 'stopped') {
+          this.handlers.onStatus?.('stopped')
+          this.resolveStopWaiters()
+        } else if (msg.type === 'info' || msg.type === 'ready' || msg.type === 'started') {
           this.handlers.onStatus?.(msg.type)
         }
       } catch {
@@ -126,45 +128,46 @@ export class LiveAudioSocket {
     this.source.connect(this.processor)
     this.processor.connect(this.audioCtx.destination)
 
-    this.processTimer = window.setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'process' }))
-      }
-    }, Math.max(5, this.processEverySec) * 1000)
-
-    this.handlers.onStatus?.('listening')
+    this.handlers.onStatus?.('recording')
   }
 
-  /** Optional force refresh (shortcuts). */
-  refresh() {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'refresh' }))
-    }
+  private resolveStopWaiters() {
+    const waiters = this.stopWaiters.splice(0)
+    waiters.forEach((fn) => fn())
   }
 
+  /**
+   * Stop mic, wait for server answer (or timeout), then close.
+   * Answer is delivered via onAnswer before this resolves.
+   */
   async stop(finalProcess = true) {
-    if (this.processTimer) {
-      clearInterval(this.processTimer)
-      this.processTimer = null
-    }
-    try {
-      if (finalProcess && this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'stop' }))
-      }
-    } catch {
-      // ignore
-    }
-
+    // Stop capturing immediately so we don't append more audio.
     this.processor?.disconnect()
     this.source?.disconnect()
     this.processor = null
     this.source = null
-
+    this.stream?.getTracks().forEach((t) => t.stop())
+    this.stream = null
     await this.audioCtx?.close().catch(() => {})
     this.audioCtx = null
 
-    this.stream?.getTracks().forEach((t) => t.stop())
-    this.stream = null
+    try {
+      if (finalProcess && this.ws?.readyState === WebSocket.OPEN) {
+        const done = new Promise<void>((resolve) => {
+          this.stopWaiters.push(resolve)
+          window.setTimeout(resolve, 90000)
+        })
+        this.handlers.onTurnStatus?.({
+          state: 'processing',
+          reason: 'stop',
+          message: 'thinking…',
+        })
+        this.ws.send(JSON.stringify({ type: 'stop' }))
+        await done
+      }
+    } catch {
+      // ignore
+    }
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close()

@@ -1,18 +1,9 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, Message, Session } from '../api'
-import { LiveAudioSocket, TurnState } from '../audioWs'
+import { LiveAudioSocket } from '../audioWs'
 import AnswerMarkdown from '../components/AnswerMarkdown'
 import DragRegion from '../components/DragRegion'
-
-function statusLabel(recording: boolean, busy: boolean, turnState: TurnState | string, turnMessage: string) {
-  if (busy && !recording) return 'processing…'
-  if (!recording) return 'ready'
-  if (turnState === 'processing') return 'thinking…'
-  if (turnState === 'stable') return turnMessage || 'answer ready'
-  if (recording) return turnMessage || 'listening…'
-  return 'ready'
-}
 
 function detectIsMac() {
   const ua = navigator.userAgent || ''
@@ -28,8 +19,7 @@ const SHORTCUTS: ShortcutRow[] = [
   { action: 'Toggle history', win: 'Ctrl + Shift + H', mac: '⌘ + Shift + H' },
   { action: 'Open ask box', win: 'Ctrl + Shift + A', mac: '⌘ + Shift + A' },
   { action: 'Capture screen → AI', win: 'Ctrl + Shift + S', mac: '⌘ + Shift + S' },
-  { action: 'Live mic on / off', win: 'Ctrl + Shift + M', mac: '⌘ + Shift + M' },
-  { action: 'Refresh answer now', win: 'Ctrl + Shift + G', mac: '⌘ + Shift + G' },
+  { action: 'Mic start / stop (same key)', win: 'Ctrl + Shift + M', mac: '⌘ + Shift + M' },
   { action: 'Opacity up', win: 'Ctrl + Shift + ↑', mac: '⌘ + Shift + ↑' },
   { action: 'Opacity down', win: 'Ctrl + Shift + ↓', mac: '⌘ + Shift + ↓' },
   { action: 'Click-through on / off', win: 'Ctrl + Shift + C', mac: '⌘ + Shift + C' },
@@ -53,14 +43,13 @@ export default function LiveSessionPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [recording, setRecording] = useState(false)
+  const [statusText, setStatusText] = useState('ready')
   const [showToolbar, setShowToolbar] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   const [showAsk, setShowAsk] = useState(false)
   const [opacity, setOpacity] = useState(0.92)
   const [clickThrough, setClickThrough] = useState(false)
   const [stealth, setStealth] = useState(true)
-  const [turnState, setTurnState] = useState<TurnState | string>('listening')
-  const [turnMessage, setTurnMessage] = useState('')
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [isMac] = useState(() => detectIsMac())
   const liveAudioRef = useRef<LiveAudioSocket | null>(null)
@@ -108,26 +97,26 @@ export default function LiveSessionPage() {
   }, [sessionId])
 
   const toggleMic = useCallback(async () => {
+    // STOP -> answer from this recording (answer stays on screen)
     if (recording) {
       setBusy(true)
+      setStatusText('thinking…')
       try {
         await liveAudioRef.current?.stop(true)
       } finally {
         liveAudioRef.current = null
         setRecording(false)
-        setTurnState('stopped')
-        setTurnMessage('')
         setBusy(false)
+        setStatusText((prev) => (prev === 'thinking…' ? 'ready' : prev))
       }
       return
     }
 
+    // START -> record only
     try {
       setError('')
       setBusy(true)
-      setTurnState('listening')
-      setTurnMessage('listening…')
-      lastSavedAnswerRef.current = ''
+      setStatusText('recording…')
       const cfg = await api.realtimeConfig()
       const socket = new LiveAudioSocket(
         cfg.ws_url,
@@ -138,14 +127,14 @@ export default function LiveSessionPage() {
         {
           onAnswer: (payload) => {
             if (!payload.answer) return
+            // Replace only when a new stop-answer arrives. Never clear on stop.
             setAnswer(payload.answer)
-            setTurnState('stable')
-            setTurnMessage('answer ready')
+            setStatusText('answer ready')
             if (payload.answer !== lastSavedAnswerRef.current) {
               lastSavedAnswerRef.current = payload.answer
               void api.storeMessage(sessionId, {
                 channel: 'voice',
-                input: '[live audio]',
+                input: '[mic segment]',
                 answer: payload.answer,
               }).then((message) => {
                 setMessages((prev) => [message, ...prev])
@@ -153,22 +142,23 @@ export default function LiveSessionPage() {
             }
           },
           onTurnStatus: (payload) => {
-            setTurnState(payload.state)
-            if (payload.message) setTurnMessage(payload.message)
+            if (payload.message) setStatusText(payload.message)
+            else if (payload.state === 'processing') setStatusText('thinking…')
+            else if (payload.state === 'recording') setStatusText('recording…')
           },
           onError: (message) => setError(message),
         },
-        cfg.chunk_process_seconds || 10,
       )
       await socket.start()
       liveAudioRef.current = socket
       setRecording(true)
+      setStatusText('recording…')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Live mic failed')
+      setError(err instanceof Error ? err.message : 'Mic failed')
       await liveAudioRef.current?.stop(false).catch(() => {})
       liveAudioRef.current = null
       setRecording(false)
-      setTurnState('stopped')
+      setStatusText('ready')
     } finally {
       setBusy(false)
     }
@@ -192,12 +182,6 @@ export default function LiveSessionPage() {
       }
       if (payload.action === 'capture-screen') void captureScreen()
       if (payload.action === 'toggle-mic') void toggleMic()
-      if (payload.action === 'answer-now') {
-        // Optional force refresh only — normal use is continuous auto.
-        liveAudioRef.current?.refresh()
-        setTurnState('processing')
-        setTurnMessage('thinking…')
-      }
     })
     const offOpacity = desktop.onOpacity((payload) => setOpacity(payload.value))
     const offClick = desktop.onClickThrough((payload) => setClickThrough(payload.enabled))
@@ -240,7 +224,7 @@ export default function LiveSessionPage() {
           <div style={{ minWidth: 0 }}>
             <h1>{session?.title || 'Live session'}</h1>
             <div className="muted">
-              {session?.mode} · {statusLabel(recording, busy, turnState, turnMessage)}
+              {session?.mode} · {busy && !recording ? 'working…' : statusText}
             </div>
           </div>
           <div className="no-drag" style={{ display: 'flex', gap: 6 }}>
@@ -274,7 +258,7 @@ export default function LiveSessionPage() {
             </button>
             <button
               className="icon-btn"
-              title={`Hide to tray (${modLabel}+Shift+Space)`}
+              title={`Hide (${modLabel}+Shift+Space)`}
               onClick={() => void window.cueaiDesktop?.windowAction?.('hide')}
             >
               ▭
@@ -285,8 +269,13 @@ export default function LiveSessionPage() {
 
         {showToolbar && (
           <div className="toolbar no-drag">
-            <button className={`chip ${recording ? 'on' : ''}`} onClick={() => void toggleMic()} disabled={busy}>
-              {recording ? 'Stop mic' : 'Start mic'}
+            <button
+              className={`chip ${recording ? 'on' : ''}`}
+              onClick={() => void toggleMic()}
+              disabled={busy && !recording}
+              title={`${modLabel}+Shift+M`}
+            >
+              {recording ? 'Stop mic → answer' : 'Start mic'}
             </button>
             <button className="chip" onClick={() => void captureScreen()} disabled={busy}>Screen</button>
             <button className={`chip ${showAsk ? 'on' : ''}`} onClick={() => setShowAsk((v) => !v)}>Ask</button>
@@ -297,7 +286,6 @@ export default function LiveSessionPage() {
                 setStealth(next)
                 await window.cueaiDesktop?.setContentProtection?.(next)
               }}
-              title={`Hide from screen share (${modLabel}+Shift+P)`}
             >
               {stealth ? 'Stealth ON' : 'Stealth OFF'}
             </button>
@@ -308,11 +296,10 @@ export default function LiveSessionPage() {
                 setClickThrough(next)
                 await window.cueaiDesktop?.setClickThrough?.(next)
               }}
-              title={`Click-through (${modLabel}+Shift+C)`}
             >
               Click-through
             </button>
-            <div className="opacity-row" title={`${modLabel}+Shift+Up/Down`}>
+            <div className="opacity-row">
               <span className="muted">Opacity</span>
               <input
                 type="range"
@@ -333,9 +320,7 @@ export default function LiveSessionPage() {
             <div className="shortcuts-head">
               <div>
                 <strong>Keyboard shortcuts</strong>
-                <div className="muted">
-                  This device: {isMac ? 'Mac (⌘ Command)' : 'Windows (Ctrl)'}
-                </div>
+                <div className="muted">This device: {isMac ? 'Mac (⌘)' : 'Windows (Ctrl)'}</div>
               </div>
               <button className="chip" onClick={() => setShowShortcuts(false)}>Close</button>
             </div>
@@ -354,21 +339,21 @@ export default function LiveSessionPage() {
               ))}
             </div>
             <div className="muted" style={{ marginTop: 8 }}>
-              Normal use: Start mic and keep it on. Answers update automatically.
+              Flow: Start mic → talk → Stop mic → answer appears and stays.
             </div>
           </div>
         )}
 
         {error && <div className="error no-drag">{error}</div>}
 
-        <div className={`answer-box no-drag ${recording && turnState === 'stable' ? 'answer-locked' : ''}`}>
+        <div className="answer-box no-drag">
           {answer ? (
             <AnswerMarkdown content={answer} />
           ) : (
             <div className="answer muted">
               {recording
-                ? 'Listening… ask your question, answer will appear here.'
-                : <>Ready. Start mic from toolbar ({modLabel}+Shift+M), or press <button className="linkish" type="button" onClick={() => setShowShortcuts(true)}>?</button> for shortcuts.</>}
+                ? 'Recording… press Stop mic (same key) when the question/segment is done.'
+                : <>Ready. Press Start mic ({modLabel}+Shift+M). Stop mic to get the answer. <button className="linkish" type="button" onClick={() => setShowShortcuts(true)}>?</button></>}
             </div>
           )}
         </div>
@@ -383,12 +368,10 @@ export default function LiveSessionPage() {
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
-                  if (!busy && text.trim()) {
-                    e.currentTarget.form?.requestSubmit()
-                  }
+                  if (!busy && text.trim()) e.currentTarget.form?.requestSubmit()
                 }
               }}
-              placeholder="Type a question… (Enter to send, Shift+Enter for new line)"
+              placeholder="Type a question… (Enter to send)"
             />
             <button className="btn" disabled={busy}>{busy ? '…' : 'Ask'}</button>
           </form>
@@ -412,7 +395,9 @@ export default function LiveSessionPage() {
         )}
 
         <DragRegion className="hint-bar">
-          {recording ? 'Mic on · answers auto-update after a short stable hold' : `${modLabel}+Shift+M mic · ? shortcuts · T toolbar`}
+          {recording
+            ? `${modLabel}+Shift+M stop → answer`
+            : `${modLabel}+Shift+M start/stop mic · answer stays on screen`}
           {stealth ? ' · stealth ON' : ''}
         </DragRegion>
       </div>
