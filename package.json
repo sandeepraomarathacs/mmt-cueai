@@ -1,0 +1,79 @@
+{
+  "name": "cueai-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "description": "CueAI desktop overlay — interview / meeting assistant",
+  "author": "Manmayi Tech",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev:free": "node scripts/free-dev.mjs",
+    "dev": "npm run dev:free && concurrently -k -n vite,electron -c cyan,magenta \"npm run dev:vite\" \"npm run dev:electron:wait\"",
+    "dev:vite": "vite --port 5174 --strictPort --host 127.0.0.1",
+    "dev:electron:wait": "wait-on http://127.0.0.1:5174 && npm run dev:electron",
+    "dev:electron": "cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5174 electron .",
+    "build": "vite build",
+    "preview": "vite preview",
+    "dist": "npm run build && electron-builder",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.manmayitech.cueai",
+    "productName": "CueAI",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.cjs"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "CueAI-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.productivity",
+      "artifactName": "CueAI-${version}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility",
+      "artifactName": "CueAI-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.3",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "concurrently": "^10.0.7",
+    "cross-env": "^7.0.3",
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6",
+    "wait-on": "^9.5.1"
+  },
+  "dependencies": {
+    "electron-store": "^12.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.7"
+  }
+}
