@@ -9,8 +9,10 @@ import io
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -51,6 +53,14 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 LARAVEL_API_URL = os.getenv("LARAVEL_API_URL", "http://127.0.0.1:8000").rstrip("/")
 RPM_LIMIT = int(os.getenv("RPM_LIMIT", "10"))
 SAMPLE_RATE = 16000
+# Live-mic turn control (token-aware)
+GATE_MODEL = os.getenv("GEMINI_GATE_MODEL", GEMINI_MODEL).strip() or GEMINI_MODEL
+SPEECH_RMS_THRESHOLD = float(os.getenv("SPEECH_RMS_THRESHOLD", "0.012"))
+SPEECH_MIN_RATIO = float(os.getenv("SPEECH_MIN_RATIO", "0.08"))
+LOCK_COOLDOWN_SEC = float(os.getenv("LOCK_COOLDOWN_SEC", "4.0"))
+NEW_QUESTION_CONFIDENCE = float(os.getenv("NEW_QUESTION_CONFIDENCE", "0.62"))
+AUDIO_WINDOW_SEC = int(os.getenv("AUDIO_WINDOW_SEC", "14"))
+KEEP_AUDIO_SEC = int(os.getenv("KEEP_AUDIO_SEC", "4"))
 
 if REQUIRE_API_KEY and not API_SECRET_KEY:
     raise RuntimeError("API_SECRET_KEY is required when REQUIRE_API_KEY=true")
@@ -115,10 +125,10 @@ def system_prompt(mode: str, language: str, context: Optional[str] = None) -> st
     mode = (mode or "interview").lower()
     base = {
         "interview": (
-            "You are a real-time AI interview assistant. Detect questions from the conversation "
+            "You are a real-time AI interview assistant. Detect the interviewer's latest question "
             "and give concise, accurate spoken-style answers the candidate can use live. "
-            "Prefer short bullet points and clear structure. For coding questions, give approach "
-            "first, then clean code, then complexity."
+            "Ignore the candidate reading/speaking a prior answer. Prefer short bullet points and "
+            "clear structure. For coding questions, give approach first, then clean code, then complexity."
         ),
         "sales": (
             "You are a real-time AI sales-call assistant. Suggest sharp replies, discovery "
@@ -139,7 +149,8 @@ def system_prompt(mode: str, language: str, context: Optional[str] = None) -> st
         parts.append(f"Session context / documents:\n{context[:8000]}")
     parts.append(
         "If input is audio or a screen image, first understand what is being asked, "
-        "then answer. If no clear question is present, summarize useful talking points."
+        "then answer. If no clear question is present, summarize useful talking points. "
+        "Do not invent a new answer when the audio is only the candidate speaking an existing reply."
     )
     return "\n\n".join(parts)
 
@@ -157,6 +168,64 @@ def pcm16_bytes_to_float(pcm: bytes) -> np.ndarray:
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def speech_stats(audio: np.ndarray, frame_ms: int = 30) -> Tuple[float, float]:
+    """Return (rms, speech_frame_ratio) for cheap local VAD."""
+    if audio.size == 0:
+        return 0.0, 0.0
+    rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64)))
+    frame = max(1, int(SAMPLE_RATE * frame_ms / 1000))
+    if audio.size < frame:
+        return rms, 1.0 if rms >= SPEECH_RMS_THRESHOLD else 0.0
+    n = audio.size // frame
+    if n <= 0:
+        return rms, 0.0
+    frames = audio[: n * frame].reshape(n, frame)
+    frame_rms = np.sqrt(np.mean(np.square(frames), axis=1, dtype=np.float64))
+    ratio = float(np.mean(frame_rms >= SPEECH_RMS_THRESHOLD))
+    return rms, ratio
+
+
+def has_enough_speech(audio: np.ndarray) -> bool:
+    rms, ratio = speech_stats(audio)
+    return rms >= SPEECH_RMS_THRESHOLD and ratio >= SPEECH_MIN_RATIO
+
+
+def _normalize_words(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def text_overlap_ratio(a: str, b: str) -> float:
+    wa = set(_normalize_words(a))
+    wb = set(_normalize_words(b))
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / max(1, min(len(wa), len(wb)))
+
+
+def answer_fingerprint(answer: str, limit: int = 420) -> str:
+    clean = re.sub(r"\s+", " ", (answer or "").strip())
+    return clean[:limit]
+
+
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 async def gemini_generate(
     *,
     prompt: str,
@@ -165,6 +234,10 @@ async def gemini_generate(
     audio_mime: str = "audio/wav",
     image_bytes: Optional[bytes] = None,
     image_mime: str = "image/png",
+    model: Optional[str] = None,
+    temperature: float = 0.4,
+    max_output_tokens: Optional[int] = None,
+    response_mime_type: Optional[str] = None,
 ) -> str:
     client = require_gemini()
     contents: List[Any] = []
@@ -175,15 +248,23 @@ async def gemini_generate(
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
     contents.append(prompt)
 
+    cfg_kwargs: Dict[str, Any] = {
+        "system_instruction": system,
+        "temperature": temperature,
+    }
+    if max_output_tokens is not None:
+        cfg_kwargs["max_output_tokens"] = max_output_tokens
+    if response_mime_type:
+        cfg_kwargs["response_mime_type"] = response_mime_type
+
+    use_model = model or GEMINI_MODEL
+
     async with GLOBAL_SEMAPHORE:
         def _call():
             return client.models.generate_content(
-                model=GEMINI_MODEL,
+                model=use_model,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.4,
-                ),
+                config=types.GenerateContentConfig(**cfg_kwargs),
             )
 
         response = await asyncio.to_thread(_call)
@@ -204,6 +285,98 @@ def make_answer(answer: str, mode: str, transcript: Optional[str] = None) -> dic
         "model": GEMINI_MODEL,
         "mode": mode,
         "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+async def classify_live_turn(
+    *,
+    wav: bytes,
+    locked_answer: Optional[str],
+    last_question: Optional[str],
+    language: str,
+) -> Dict[str, Any]:
+    """Cheap gate: decide whether to keep lock or generate a new answer."""
+    locked_snip = answer_fingerprint(locked_answer or "", 360)
+    last_q = (last_question or "").strip()[:240]
+    prompt = (
+        "You are a turn classifier for a live interview assistant.\n"
+        "Audio may contain the interviewer and/or the candidate.\n"
+        "Classify the LATEST speech turn.\n\n"
+        f"Respond in JSON only. Language hint: {language}.\n"
+        "Schema:\n"
+        '{'
+        '"action":"new_question"|"candidate_answer"|"noise"|"same_question",'
+        '"confidence":0.0,'
+        '"question":"short interviewer question if any",'
+        '"heard":"very short transcript of latest speech"'
+        "}\n\n"
+        "Rules:\n"
+        "- new_question: interviewer asks a new/different question that needs a fresh answer.\n"
+        "- same_question: same question as before / follow-up that does not need a new answer card.\n"
+        "- candidate_answer: candidate is speaking, reading, or paraphrasing the locked answer.\n"
+        "- noise: silence, filler, crosstalk, or unclear speech.\n"
+        f"Locked answer snippet:\n{locked_snip or '(none)'}\n"
+        f"Previous question:\n{last_q or '(none)'}\n"
+    )
+    gate_system = (
+        "Classify live interview audio turns. Be conservative about new_question. "
+        "If speech overlaps the locked answer, choose candidate_answer. "
+        "Return JSON only."
+    )
+    try:
+        raw = await gemini_generate(
+            prompt=prompt,
+            system=gate_system,
+            audio_bytes=wav,
+            audio_mime="audio/wav",
+            model=GATE_MODEL,
+            temperature=0.1,
+            max_output_tokens=160,
+            response_mime_type="application/json",
+        )
+    except Exception:
+        # Some models reject response_mime_type — retry plain text JSON.
+        log.warning("gate json-mime failed; retrying plain")
+        raw = await gemini_generate(
+            prompt=prompt,
+            system=gate_system,
+            audio_bytes=wav,
+            audio_mime="audio/wav",
+            model=GATE_MODEL,
+            temperature=0.1,
+            max_output_tokens=160,
+        )
+    data = extract_json_object(raw) or {}
+    action = str(data.get("action") or "noise").strip().lower()
+    if action not in {"new_question", "candidate_answer", "noise", "same_question"}:
+        action = "noise"
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    heard = str(data.get("heard") or "").strip()
+    question = str(data.get("question") or "").strip()
+
+    # Local overlap backup: if heard text is close to locked answer, force candidate_answer.
+    if locked_snip and heard and text_overlap_ratio(heard, locked_snip) >= 0.45:
+        action = "candidate_answer"
+        confidence = max(confidence, 0.75)
+
+    if (
+        action == "new_question"
+        and last_q
+        and question
+        and text_overlap_ratio(question, last_q) >= 0.72
+        and confidence < 0.9
+    ):
+        action = "same_question"
+
+    return {
+        "action": action,
+        "confidence": confidence,
+        "question": question,
+        "heard": heard,
     }
 
 
@@ -294,7 +467,10 @@ async def websocket_audio(ws: WebSocket):
     Protocol:
       client -> {"type":"start","mode":"interview","language":"English","context":"..."}
       client -> binary PCM16 frames
-      client -> {"type":"process"} | {"type":"stop"}
+      client -> {"type":"process"} | {"type":"unlock"} | {"type":"refresh"} | {"type":"stop"}
+    Server:
+      {"type":"answer", ... , "locked": true, "state":"locked"}
+      {"type":"turn_status","state":"locked|listening|waiting","reason":"...","answer_stable":true}
     """
     if not await authorize_websocket(ws, API_SECRET_KEY, REQUIRE_API_KEY):
         log.warning("ws unauthorized")
@@ -306,39 +482,206 @@ async def websocket_audio(ws: WebSocket):
     context: Optional[str] = None
     buffer = bytearray()
     processing = False
+    turn_state = "listening"  # listening | locked | waiting
+    locked_answer: Optional[str] = None
+    last_question: Optional[str] = None
+    locked_at = 0.0
     log.info("ws connected")
 
-    async def process_buffer(final: bool = False) -> None:
-        nonlocal processing, buffer
+    def trim_buffer(keep_sec: int = KEEP_AUDIO_SEC) -> None:
+        keep = SAMPLE_RATE * 2 * max(1, keep_sec)
+        if len(buffer) > keep:
+            del buffer[:-keep]
+
+    def window_audio() -> np.ndarray:
+        max_bytes = SAMPLE_RATE * 2 * max(6, AUDIO_WINDOW_SEC)
+        chunk = bytes(buffer[-max_bytes:]) if len(buffer) > max_bytes else bytes(buffer)
+        return pcm16_bytes_to_float(chunk)
+
+    async def send_turn_status(
+        *,
+        state: str,
+        reason: str,
+        answer_stable: bool = False,
+        message: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "type": "turn_status",
+            "state": state,
+            "reason": reason,
+            "answer_stable": answer_stable,
+            "has_answer": bool(locked_answer),
+        }
+        if message:
+            payload["message"] = message
+        if confidence is not None:
+            payload["confidence"] = confidence
+        await ws.send_json(payload)
+
+    async def emit_answer(answer: str, *, final: bool, reason: str, question: Optional[str] = None) -> None:
+        nonlocal turn_state, locked_answer, last_question, locked_at
+        locked_answer = answer.strip()
+        if question:
+            last_question = question.strip()[:320]
+        turn_state = "locked"
+        locked_at = time.monotonic()
+        payload = make_answer(locked_answer, mode, transcript=last_question)
+        payload.update(
+            {
+                "type": "answer",
+                "final": final,
+                "locked": True,
+                "state": "locked",
+                "reason": reason,
+            }
+        )
+        await ws.send_json(payload)
+
+    async def generate_live_answer(wav: bytes, question_hint: Optional[str] = None) -> str:
+        system = system_prompt(mode, language, context)
+        hint = (question_hint or "").strip()
+        prompt = (
+            "This is a live interview/call audio window.\n"
+            "Focus on the interviewer's latest question only.\n"
+            "Ignore candidate speech that is reading/paraphrasing a previous answer.\n"
+            "Provide a concise real-time answer the candidate can speak now.\n"
+        )
+        if hint:
+            prompt += f"\nDetected question hint:\n{hint}\n"
+        if locked_answer:
+            prompt += (
+                "\nDo not repeat the previous answer unless the question is the same.\n"
+                f"Previous locked answer fingerprint:\n{answer_fingerprint(locked_answer, 220)}\n"
+            )
+        return await gemini_generate(
+            prompt=prompt,
+            system=system,
+            audio_bytes=wav,
+            audio_mime="audio/wav",
+            temperature=0.35,
+            max_output_tokens=900,
+        )
+
+    async def process_buffer(final: bool = False, force: bool = False) -> None:
+        nonlocal processing, turn_state, locked_answer, last_question, locked_at
         if processing:
             await ws.send_json({"type": "info", "message": "already processing"})
             return
-        if len(buffer) < SAMPLE_RATE:
+        if len(buffer) < SAMPLE_RATE:  # < ~0.5s
             await ws.send_json({"type": "info", "message": "not enough audio yet"})
             return
 
         processing = True
         try:
-            audio = pcm16_bytes_to_float(bytes(buffer))
+            audio = window_audio()
+            if not force and not has_enough_speech(audio):
+                await send_turn_status(
+                    state=turn_state if locked_answer else "listening",
+                    reason="silence",
+                    answer_stable=bool(locked_answer),
+                    message="waiting for speech",
+                )
+                if not final:
+                    trim_buffer()
+                return
+
             wav = audio_to_wav_bytes(audio)
-            system = system_prompt(mode, language, context)
-            answer = await gemini_generate(
-                prompt=(
-                    "This is a live call audio chunk. Detect the latest question or prompt "
-                    "and provide a concise real-time answer the user can speak."
-                ),
-                system=system,
-                audio_bytes=wav,
-                audio_mime="audio/wav",
+
+            # First answer (or forced refresh): generate once, then lock.
+            if force or locked_answer is None:
+                await send_turn_status(
+                    state="processing",
+                    reason="generating",
+                    answer_stable=False,
+                    message="generating answer",
+                )
+                answer = await generate_live_answer(wav)
+                if not answer:
+                    await send_turn_status(
+                        state="listening",
+                        reason="empty_answer",
+                        answer_stable=False,
+                        message="no answer produced",
+                    )
+                else:
+                    await emit_answer(answer, final=final, reason="new_answer")
+                if not final:
+                    trim_buffer()
+                return
+
+            # Locked: cheap gate only — skip full answer unless new interviewer turn.
+            if (time.monotonic() - locked_at) < LOCK_COOLDOWN_SEC and not final:
+                await send_turn_status(
+                    state="locked",
+                    reason="cooldown",
+                    answer_stable=True,
+                    message="answer locked (cooldown)",
+                )
+                trim_buffer()
+                return
+
+            await send_turn_status(
+                state="locked",
+                reason="classifying",
+                answer_stable=True,
+                message="checking speaker turn",
             )
-            payload = make_answer(answer, mode)
-            payload["type"] = "answer"
-            payload["final"] = final
-            await ws.send_json(payload)
+            gate = await classify_live_turn(
+                wav=wav,
+                locked_answer=locked_answer,
+                last_question=last_question,
+                language=language,
+            )
+            action = gate["action"]
+            confidence = float(gate["confidence"])
+            question = gate.get("question") or None
+
+            if action in {"candidate_answer", "noise", "same_question"} or (
+                action == "new_question" and confidence < NEW_QUESTION_CONFIDENCE
+            ):
+                reason = action if action != "new_question" else "low_confidence"
+                turn_state = "locked" if action != "noise" else ("waiting" if locked_answer else "listening")
+                await send_turn_status(
+                    state="locked" if locked_answer else "listening",
+                    reason=reason,
+                    answer_stable=True,
+                    message="keeping current answer",
+                    confidence=confidence,
+                )
+                if not final:
+                    trim_buffer()
+                return
+
+            # New interviewer question with enough confidence → unlock + regenerate once.
+            turn_state = "listening"
+            await send_turn_status(
+                state="processing",
+                reason="new_question",
+                answer_stable=False,
+                message="new question detected",
+                confidence=confidence,
+            )
+            answer = await generate_live_answer(wav, question_hint=question)
+            if not answer:
+                # Keep previous stable answer if regeneration fails.
+                turn_state = "locked"
+                await send_turn_status(
+                    state="locked",
+                    reason="regen_failed",
+                    answer_stable=True,
+                    message="kept previous answer",
+                    confidence=confidence,
+                )
+            else:
+                await emit_answer(
+                    answer,
+                    final=final,
+                    reason="new_question",
+                    question=question,
+                )
             if not final:
-                keep = SAMPLE_RATE * 2 * 2
-                if len(buffer) > keep:
-                    del buffer[:-keep]
+                trim_buffer()
         except Exception:
             log.exception("ws process failed")
             await ws.send_json({"type": "error", "message": "processing failed"})
@@ -346,7 +689,7 @@ async def websocket_audio(ws: WebSocket):
             processing = False
 
     try:
-        await ws.send_json({"type": "ready"})
+        await ws.send_json({"type": "ready", "features": ["turn_lock", "vad", "gate"]})
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -354,6 +697,10 @@ async def websocket_audio(ws: WebSocket):
 
             if message.get("bytes") is not None:
                 buffer.extend(message["bytes"])
+                # Cap memory (~45s PCM16 mono)
+                max_buf = SAMPLE_RATE * 2 * 45
+                if len(buffer) > max_buf:
+                    del buffer[:-max_buf]
                 continue
 
             text = message.get("text")
@@ -372,15 +719,42 @@ async def websocket_audio(ws: WebSocket):
                 language = data.get("language") or language
                 context = data.get("context") or context
                 buffer.clear()
-                await ws.send_json({"type": "started", "mode": mode})
+                turn_state = "listening"
+                locked_answer = None
+                last_question = None
+                locked_at = 0.0
+                await ws.send_json({"type": "started", "mode": mode, "state": "listening"})
             elif msg_type == "context":
                 context = data.get("context") or context
                 await ws.send_json({"type": "ok"})
             elif msg_type == "process":
-                await process_buffer(final=False)
+                await process_buffer(final=False, force=False)
+            elif msg_type == "unlock":
+                turn_state = "listening"
+                locked_answer = None
+                last_question = None
+                locked_at = 0.0
+                await send_turn_status(
+                    state="listening",
+                    reason="manual_unlock",
+                    answer_stable=False,
+                    message="unlocked — waiting for next question",
+                )
+            elif msg_type == "refresh":
+                # Force a new answer from current audio window.
+                await process_buffer(final=False, force=True)
             elif msg_type == "stop":
-                await process_buffer(final=True)
-                await ws.send_json({"type": "stopped"})
+                # On stop: do not burn tokens regenerating if already locked.
+                if locked_answer is None:
+                    await process_buffer(final=True, force=True)
+                else:
+                    await send_turn_status(
+                        state="locked",
+                        reason="stopped",
+                        answer_stable=True,
+                        message="session mic stopped",
+                    )
+                await ws.send_json({"type": "stopped", "state": turn_state})
                 break
             else:
                 await ws.send_json({"type": "error", "message": f"unknown type {msg_type}"})
