@@ -1,11 +1,8 @@
 /**
  * Live mic → Python /ws/audio as PCM16 mono chunks.
- *
- * Best UX: keep mic ON (buffering). Press Answer now when interviewer
- * finishes a question. Auto silence-turn can also fire, but Answer now
- * is the reliable path — no need to stop/start mic each question.
+ * Simple continuous listening; server holds answers stable for a short window.
  */
-export type TurnState = 'listening' | 'locked' | 'armed' | 'waiting' | 'processing' | 'stopped'
+export type TurnState = 'listening' | 'processing' | 'stable' | 'stopped'
 
 export type AudioWsHandlers = {
   onAnswer?: (payload: {
@@ -20,7 +17,6 @@ export type AudioWsHandlers = {
     reason?: string
     answer_stable?: boolean
     message?: string
-    confidence?: number
   }) => void
   onError?: (message: string) => void
   onStatus?: (message: string) => void
@@ -55,22 +51,13 @@ export class LiveAudioSocket {
   private source: MediaStreamAudioSourceNode | null = null
   private processTimer: number | null = null
   private readonly targetRate = 16000
-  private turnState: TurnState | string = 'listening'
-  /** Cheap VAD tick interval (server skips Gemini unless utterance ends / answer_now). */
-  private readonly tickEverySec: number
 
   constructor(
     private readonly wsUrl: string,
     private readonly meta: { mode: string; language?: string; context?: string },
     private readonly handlers: AudioWsHandlers,
-    tickEverySec = 2.5,
-  ) {
-    this.tickEverySec = Math.max(1.5, tickEverySec)
-  }
-
-  get state() {
-    return this.turnState
-  }
+    private readonly processEverySec = 10,
+  ) {}
 
   async start() {
     this.ws = new WebSocket(this.wsUrl)
@@ -88,31 +75,27 @@ export class LiveAudioSocket {
       try {
         const msg = JSON.parse(ev.data)
         if (msg.type === 'answer') {
-          if (msg.state) this.turnState = msg.state
           this.handlers.onAnswer?.({
             answer: msg.answer,
             final: !!msg.final,
-            locked: msg.locked !== false,
+            locked: !!msg.locked,
             reason: msg.reason,
             state: msg.state,
           })
         } else if (msg.type === 'turn_status') {
-          if (msg.state) this.turnState = msg.state
           this.handlers.onTurnStatus?.({
-            state: msg.state || this.turnState,
+            state: msg.state || 'listening',
             reason: msg.reason,
             answer_stable: !!msg.answer_stable,
             message: msg.message,
-            confidence: typeof msg.confidence === 'number' ? msg.confidence : undefined,
           })
         } else if (msg.type === 'error') {
           this.handlers.onError?.(msg.message || 'WS error')
         } else if (msg.type === 'info' || msg.type === 'ready' || msg.type === 'started' || msg.type === 'stopped') {
-          if (msg.state) this.turnState = msg.state
           this.handlers.onStatus?.(msg.type)
         }
       } catch {
-        // ignore non-json
+        // ignore
       }
     }
 
@@ -143,33 +126,20 @@ export class LiveAudioSocket {
     this.source.connect(this.processor)
     this.processor.connect(this.audioCtx.destination)
 
-    // Frequent cheap ticks for silence-turn auto; Gemini only when utterance completes.
     this.processTimer = window.setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'process' }))
       }
-    }, Math.round(this.tickEverySec * 1000))
+    }, Math.max(5, this.processEverySec) * 1000)
 
     this.handlers.onStatus?.('listening')
   }
 
-  /** Manual unlock — arm for next question without regenerating. */
-  unlock() {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'unlock' }))
-    }
-  }
-
-  /** Reliable: generate answer from recent buffered audio (mic stays on). */
-  answerNow() {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'answer_now' }))
-    }
-  }
-
-  /** Alias kept for older UI. */
+  /** Optional force refresh (shortcuts). */
   refresh() {
-    this.answerNow()
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'refresh' }))
+    }
   }
 
   async stop(finalProcess = true) {
@@ -200,7 +170,6 @@ export class LiveAudioSocket {
       this.ws.close()
     }
     this.ws = null
-    this.turnState = 'stopped'
     this.handlers.onStatus?.('stopped')
   }
 }
