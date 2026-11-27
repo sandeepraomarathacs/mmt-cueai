@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,14 +52,18 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 LARAVEL_API_URL = os.getenv("LARAVEL_API_URL", "http://127.0.0.1:8000").rstrip("/")
 RPM_LIMIT = int(os.getenv("RPM_LIMIT", "10"))
 SAMPLE_RATE = 16000
-# Live-mic turn control (token-aware)
-GATE_MODEL = os.getenv("GEMINI_GATE_MODEL", GEMINI_MODEL).strip() or GEMINI_MODEL
+# Live-mic turn control (token-aware, silence-turn based)
 SPEECH_RMS_THRESHOLD = float(os.getenv("SPEECH_RMS_THRESHOLD", "0.012"))
 SPEECH_MIN_RATIO = float(os.getenv("SPEECH_MIN_RATIO", "0.08"))
-LOCK_COOLDOWN_SEC = float(os.getenv("LOCK_COOLDOWN_SEC", "4.0"))
-NEW_QUESTION_CONFIDENCE = float(os.getenv("NEW_QUESTION_CONFIDENCE", "0.62"))
 AUDIO_WINDOW_SEC = int(os.getenv("AUDIO_WINDOW_SEC", "14"))
-KEEP_AUDIO_SEC = int(os.getenv("KEEP_AUDIO_SEC", "4"))
+KEEP_AUDIO_SEC = int(os.getenv("KEEP_AUDIO_SEC", "3"))
+# After an answer locks, wait for this much trailing silence before arming next question.
+ARM_SILENCE_SEC = float(os.getenv("ARM_SILENCE_SEC", "1.1"))
+# A new interviewer turn must contain at least this much speech, then end in silence.
+UTTERANCE_MIN_SPEECH_SEC = float(os.getenv("UTTERANCE_MIN_SPEECH_SEC", "1.4"))
+UTTERANCE_END_SILENCE_SEC = float(os.getenv("UTTERANCE_END_SILENCE_SEC", "0.75"))
+# Optional auto answers from completed utterances (manual answer_now always works).
+AUTO_ANSWER = os.getenv("AUTO_ANSWER", "true").strip().lower() in {"1", "true", "yes"}
 
 if REQUIRE_API_KEY and not API_SECRET_KEY:
     raise RuntimeError("API_SECRET_KEY is required when REQUIRE_API_KEY=true")
@@ -168,20 +171,23 @@ def pcm16_bytes_to_float(pcm: bytes) -> np.ndarray:
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def frame_rms_series(audio: np.ndarray, frame_ms: int = 30) -> np.ndarray:
+    frame = max(1, int(SAMPLE_RATE * frame_ms / 1000))
+    if audio.size < frame:
+        rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64))) if audio.size else 0.0
+        return np.array([rms], dtype=np.float64)
+    n = audio.size // frame
+    frames = audio[: n * frame].reshape(n, frame)
+    return np.sqrt(np.mean(np.square(frames), axis=1, dtype=np.float64))
+
+
 def speech_stats(audio: np.ndarray, frame_ms: int = 30) -> Tuple[float, float]:
     """Return (rms, speech_frame_ratio) for cheap local VAD."""
     if audio.size == 0:
         return 0.0, 0.0
+    series = frame_rms_series(audio, frame_ms=frame_ms)
     rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64)))
-    frame = max(1, int(SAMPLE_RATE * frame_ms / 1000))
-    if audio.size < frame:
-        return rms, 1.0 if rms >= SPEECH_RMS_THRESHOLD else 0.0
-    n = audio.size // frame
-    if n <= 0:
-        return rms, 0.0
-    frames = audio[: n * frame].reshape(n, frame)
-    frame_rms = np.sqrt(np.mean(np.square(frames), axis=1, dtype=np.float64))
-    ratio = float(np.mean(frame_rms >= SPEECH_RMS_THRESHOLD))
+    ratio = float(np.mean(series >= SPEECH_RMS_THRESHOLD)) if series.size else 0.0
     return rms, ratio
 
 
@@ -190,40 +196,62 @@ def has_enough_speech(audio: np.ndarray) -> bool:
     return rms >= SPEECH_RMS_THRESHOLD and ratio >= SPEECH_MIN_RATIO
 
 
-def _normalize_words(text: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", (text or "").lower())
-
-
-def text_overlap_ratio(a: str, b: str) -> float:
-    wa = set(_normalize_words(a))
-    wb = set(_normalize_words(b))
-    if not wa or not wb:
+def trailing_silence_sec(audio: np.ndarray, frame_ms: int = 30) -> float:
+    series = frame_rms_series(audio, frame_ms=frame_ms)
+    if series.size == 0:
         return 0.0
-    return len(wa & wb) / max(1, min(len(wa), len(wb)))
+    silence = series < SPEECH_RMS_THRESHOLD
+    count = 0
+    for flag in silence[::-1]:
+        if not flag:
+            break
+        count += 1
+    return count * (frame_ms / 1000.0)
+
+
+def latest_completed_utterance(
+    audio: np.ndarray,
+    *,
+    min_speech_sec: float,
+    end_silence_sec: float,
+    frame_ms: int = 30,
+) -> Optional[np.ndarray]:
+    """
+    Return the latest speech segment that already ended with silence.
+    Used to detect 'interviewer finished asking'.
+    """
+    series = frame_rms_series(audio, frame_ms=frame_ms)
+    if series.size == 0:
+        return None
+    speech = series >= SPEECH_RMS_THRESHOLD
+    frame = max(1, int(SAMPLE_RATE * frame_ms / 1000))
+    min_speech_frames = max(1, int(min_speech_sec * 1000 / frame_ms))
+    end_silence_frames = max(1, int(end_silence_sec * 1000 / frame_ms))
+
+    # Walk backward: require trailing silence, then a speech run.
+    i = len(speech) - 1
+    silence_run = 0
+    while i >= 0 and not speech[i]:
+        silence_run += 1
+        i -= 1
+    if silence_run < end_silence_frames:
+        return None
+    end_speech = i
+    while i >= 0 and speech[i]:
+        i -= 1
+    start_speech = i + 1
+    speech_frames = end_speech - start_speech + 1
+    if speech_frames < min_speech_frames:
+        return None
+    start_sample = start_speech * frame
+    end_sample = min(audio.size, (end_speech + 1) * frame)
+    segment = audio[start_sample:end_sample]
+    return segment if segment.size else None
 
 
 def answer_fingerprint(answer: str, limit: int = 420) -> str:
     clean = re.sub(r"\s+", " ", (answer or "").strip())
     return clean[:limit]
-
-
-def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else None
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-        return data if isinstance(data, dict) else None
-    except json.JSONDecodeError:
-        return None
 
 
 async def gemini_generate(
@@ -285,98 +313,6 @@ def make_answer(answer: str, mode: str, transcript: Optional[str] = None) -> dic
         "model": GEMINI_MODEL,
         "mode": mode,
         "created_at": datetime.utcnow().isoformat() + "Z",
-    }
-
-
-async def classify_live_turn(
-    *,
-    wav: bytes,
-    locked_answer: Optional[str],
-    last_question: Optional[str],
-    language: str,
-) -> Dict[str, Any]:
-    """Cheap gate: decide whether to keep lock or generate a new answer."""
-    locked_snip = answer_fingerprint(locked_answer or "", 360)
-    last_q = (last_question or "").strip()[:240]
-    prompt = (
-        "You are a turn classifier for a live interview assistant.\n"
-        "Audio may contain the interviewer and/or the candidate.\n"
-        "Classify the LATEST speech turn.\n\n"
-        f"Respond in JSON only. Language hint: {language}.\n"
-        "Schema:\n"
-        '{'
-        '"action":"new_question"|"candidate_answer"|"noise"|"same_question",'
-        '"confidence":0.0,'
-        '"question":"short interviewer question if any",'
-        '"heard":"very short transcript of latest speech"'
-        "}\n\n"
-        "Rules:\n"
-        "- new_question: interviewer asks a new/different question that needs a fresh answer.\n"
-        "- same_question: same question as before / follow-up that does not need a new answer card.\n"
-        "- candidate_answer: candidate is speaking, reading, or paraphrasing the locked answer.\n"
-        "- noise: silence, filler, crosstalk, or unclear speech.\n"
-        f"Locked answer snippet:\n{locked_snip or '(none)'}\n"
-        f"Previous question:\n{last_q or '(none)'}\n"
-    )
-    gate_system = (
-        "Classify live interview audio turns. Be conservative about new_question. "
-        "If speech overlaps the locked answer, choose candidate_answer. "
-        "Return JSON only."
-    )
-    try:
-        raw = await gemini_generate(
-            prompt=prompt,
-            system=gate_system,
-            audio_bytes=wav,
-            audio_mime="audio/wav",
-            model=GATE_MODEL,
-            temperature=0.1,
-            max_output_tokens=160,
-            response_mime_type="application/json",
-        )
-    except Exception:
-        # Some models reject response_mime_type — retry plain text JSON.
-        log.warning("gate json-mime failed; retrying plain")
-        raw = await gemini_generate(
-            prompt=prompt,
-            system=gate_system,
-            audio_bytes=wav,
-            audio_mime="audio/wav",
-            model=GATE_MODEL,
-            temperature=0.1,
-            max_output_tokens=160,
-        )
-    data = extract_json_object(raw) or {}
-    action = str(data.get("action") or "noise").strip().lower()
-    if action not in {"new_question", "candidate_answer", "noise", "same_question"}:
-        action = "noise"
-    try:
-        confidence = float(data.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-    heard = str(data.get("heard") or "").strip()
-    question = str(data.get("question") or "").strip()
-
-    # Local overlap backup: if heard text is close to locked answer, force candidate_answer.
-    if locked_snip and heard and text_overlap_ratio(heard, locked_snip) >= 0.45:
-        action = "candidate_answer"
-        confidence = max(confidence, 0.75)
-
-    if (
-        action == "new_question"
-        and last_q
-        and question
-        and text_overlap_ratio(question, last_q) >= 0.72
-        and confidence < 0.9
-    ):
-        action = "same_question"
-
-    return {
-        "action": action,
-        "confidence": confidence,
-        "question": question,
-        "heard": heard,
     }
 
 
@@ -465,12 +401,16 @@ async def websocket_audio(ws: WebSocket):
     """
     Auth: ?api_key=... or Header X-API-Key / Authorization: Bearer
     Protocol:
-      client -> {"type":"start","mode":"interview","language":"English","context":"..."}
+      client -> {"type":"start",...}
       client -> binary PCM16 frames
-      client -> {"type":"process"} | {"type":"unlock"} | {"type":"refresh"} | {"type":"stop"}
-    Server:
-      {"type":"answer", ... , "locked": true, "state":"locked"}
-      {"type":"turn_status","state":"locked|listening|waiting","reason":"...","answer_stable":true}
+      client -> {"type":"process"}           # auto silence-turn check (cheap)
+      client -> {"type":"answer_now"}|"refresh"  # force answer from recent audio
+      client -> {"type":"unlock"} | {"type":"stop"}
+
+    Turn model (best for single-mic interviews):
+      listening  -> first completed utterance / answer_now => answer + lock
+      locked     -> ignore until trailing silence (candidate finished speaking)
+      armed      -> next completed utterance / answer_now => new answer + lock
     """
     if not await authorize_websocket(ws, API_SECRET_KEY, REQUIRE_API_KEY):
         log.warning("ws unauthorized")
@@ -482,10 +422,10 @@ async def websocket_audio(ws: WebSocket):
     context: Optional[str] = None
     buffer = bytearray()
     processing = False
-    turn_state = "listening"  # listening | locked | waiting
+    # listening | locked | armed | processing
+    turn_state = "listening"
     locked_answer: Optional[str] = None
     last_question: Optional[str] = None
-    locked_at = 0.0
     log.info("ws connected")
 
     def trim_buffer(keep_sec: int = KEEP_AUDIO_SEC) -> None:
@@ -498,34 +438,33 @@ async def websocket_audio(ws: WebSocket):
         chunk = bytes(buffer[-max_bytes:]) if len(buffer) > max_bytes else bytes(buffer)
         return pcm16_bytes_to_float(chunk)
 
+    def reset_after_lock() -> None:
+        """Drop old audio so candidate speech / prior question cannot poison next turn."""
+        buffer.clear()
+
     async def send_turn_status(
         *,
         state: str,
         reason: str,
         answer_stable: bool = False,
         message: Optional[str] = None,
-        confidence: Optional[float] = None,
     ) -> None:
-        payload: Dict[str, Any] = {
-            "type": "turn_status",
-            "state": state,
-            "reason": reason,
-            "answer_stable": answer_stable,
-            "has_answer": bool(locked_answer),
-        }
-        if message:
-            payload["message"] = message
-        if confidence is not None:
-            payload["confidence"] = confidence
-        await ws.send_json(payload)
+        await ws.send_json(
+            {
+                "type": "turn_status",
+                "state": state,
+                "reason": reason,
+                "answer_stable": answer_stable,
+                "has_answer": bool(locked_answer),
+                "message": message or "",
+            }
+        )
 
-    async def emit_answer(answer: str, *, final: bool, reason: str, question: Optional[str] = None) -> None:
-        nonlocal turn_state, locked_answer, last_question, locked_at
+    async def emit_answer(answer: str, *, final: bool, reason: str) -> None:
+        nonlocal turn_state, locked_answer
         locked_answer = answer.strip()
-        if question:
-            last_question = question.strip()[:320]
         turn_state = "locked"
-        locked_at = time.monotonic()
+        reset_after_lock()
         payload = make_answer(locked_answer, mode, transcript=last_question)
         payload.update(
             {
@@ -537,22 +476,25 @@ async def websocket_audio(ws: WebSocket):
             }
         )
         await ws.send_json(payload)
+        await send_turn_status(
+            state="locked",
+            reason=reason,
+            answer_stable=True,
+            message="answer ready — speak it, then wait for next question",
+        )
 
-    async def generate_live_answer(wav: bytes, question_hint: Optional[str] = None) -> str:
+    async def generate_live_answer(wav: bytes) -> str:
         system = system_prompt(mode, language, context)
-        hint = (question_hint or "").strip()
         prompt = (
             "This is a live interview/call audio window.\n"
             "Focus on the interviewer's latest question only.\n"
             "Ignore candidate speech that is reading/paraphrasing a previous answer.\n"
             "Provide a concise real-time answer the candidate can speak now.\n"
         )
-        if hint:
-            prompt += f"\nDetected question hint:\n{hint}\n"
         if locked_answer:
             prompt += (
-                "\nDo not repeat the previous answer unless the question is the same.\n"
-                f"Previous locked answer fingerprint:\n{answer_fingerprint(locked_answer, 220)}\n"
+                "\nPrevious answer fingerprint (do not repeat unless question unchanged):\n"
+                f"{answer_fingerprint(locked_answer, 220)}\n"
             )
         return await gemini_generate(
             prompt=prompt,
@@ -563,125 +505,126 @@ async def websocket_audio(ws: WebSocket):
             max_output_tokens=900,
         )
 
+    async def run_generate(*, final: bool, reason: str, audio: Optional[np.ndarray] = None) -> None:
+        nonlocal turn_state
+        use = audio if audio is not None else window_audio()
+        if use.size < SAMPLE_RATE // 2:
+            await send_turn_status(
+                state=turn_state,
+                reason="not_enough_audio",
+                answer_stable=bool(locked_answer),
+                message="not enough audio yet — keep mic on",
+            )
+            return
+        if not has_enough_speech(use) and reason != "manual_answer_now":
+            # Manual answer_now still tries — interviewer audio might be quieter.
+            await send_turn_status(
+                state=turn_state,
+                reason="silence",
+                answer_stable=bool(locked_answer),
+                message="waiting for speech",
+            )
+            return
+
+        turn_state = "processing"
+        await send_turn_status(
+            state="processing",
+            reason="generating",
+            answer_stable=False,
+            message="generating answer…",
+        )
+        wav = audio_to_wav_bytes(use)
+        answer = await generate_live_answer(wav)
+        if not answer:
+            turn_state = "armed" if locked_answer else "listening"
+            await send_turn_status(
+                state=turn_state,
+                reason="empty_answer",
+                answer_stable=bool(locked_answer),
+                message="no answer produced — press Answer now after the question",
+            )
+            return
+        await emit_answer(answer, final=final, reason=reason)
+
     async def process_buffer(final: bool = False, force: bool = False) -> None:
-        nonlocal processing, turn_state, locked_answer, last_question, locked_at
+        """
+        force/answer_now: always generate from current window.
+        auto process: silence-turn detection only (no LLM gate).
+        """
+        nonlocal processing, turn_state
         if processing:
             await ws.send_json({"type": "info", "message": "already processing"})
-            return
-        if len(buffer) < SAMPLE_RATE:  # < ~0.5s
-            await ws.send_json({"type": "info", "message": "not enough audio yet"})
             return
 
         processing = True
         try:
             audio = window_audio()
-            if not force and not has_enough_speech(audio):
-                await send_turn_status(
-                    state=turn_state if locked_answer else "listening",
-                    reason="silence",
-                    answer_stable=bool(locked_answer),
-                    message="waiting for speech",
+
+            # Manual / forced answer — most reliable path.
+            if force or final:
+                await run_generate(
+                    final=final,
+                    reason="manual_answer_now" if force else "final",
+                    audio=audio,
                 )
-                if not final:
-                    trim_buffer()
                 return
 
-            wav = audio_to_wav_bytes(audio)
-
-            # First answer (or forced refresh): generate once, then lock.
-            if force or locked_answer is None:
-                await send_turn_status(
-                    state="processing",
-                    reason="generating",
-                    answer_stable=False,
-                    message="generating answer",
-                )
-                answer = await generate_live_answer(wav)
-                if not answer:
+            # ---- AUTO path (local VAD only; no Gemini classify) ----
+            if turn_state == "locked":
+                # Wait until candidate finishes speaking (trailing silence).
+                silence = trailing_silence_sec(audio)
+                if silence >= ARM_SILENCE_SEC:
+                    reset_after_lock()
+                    turn_state = "armed"
                     await send_turn_status(
-                        state="listening",
-                        reason="empty_answer",
-                        answer_stable=False,
-                        message="no answer produced",
+                        state="armed",
+                        reason="armed",
+                        answer_stable=True,
+                        message="ready — listening for next question",
                     )
                 else:
-                    await emit_answer(answer, final=final, reason="new_answer")
-                if not final:
-                    trim_buffer()
+                    await send_turn_status(
+                        state="locked",
+                        reason="candidate_window",
+                        answer_stable=True,
+                        message="answer locked — speak freely",
+                    )
                 return
 
-            # Locked: cheap gate only — skip full answer unless new interviewer turn.
-            if (time.monotonic() - locked_at) < LOCK_COOLDOWN_SEC and not final:
+            # listening or armed: wait for a completed utterance, then answer once.
+            if not AUTO_ANSWER:
                 await send_turn_status(
-                    state="locked",
-                    reason="cooldown",
-                    answer_stable=True,
-                    message="answer locked (cooldown)",
+                    state=turn_state,
+                    reason="auto_off",
+                    answer_stable=bool(locked_answer),
+                    message="auto off — press Answer now when question ends",
                 )
-                trim_buffer()
                 return
 
-            await send_turn_status(
-                state="locked",
-                reason="classifying",
-                answer_stable=True,
-                message="checking speaker turn",
+            utterance = latest_completed_utterance(
+                audio,
+                min_speech_sec=UTTERANCE_MIN_SPEECH_SEC,
+                end_silence_sec=UTTERANCE_END_SILENCE_SEC,
             )
-            gate = await classify_live_turn(
-                wav=wav,
-                locked_answer=locked_answer,
-                last_question=last_question,
-                language=language,
-            )
-            action = gate["action"]
-            confidence = float(gate["confidence"])
-            question = gate.get("question") or None
-
-            if action in {"candidate_answer", "noise", "same_question"} or (
-                action == "new_question" and confidence < NEW_QUESTION_CONFIDENCE
-            ):
-                reason = action if action != "new_question" else "low_confidence"
-                turn_state = "locked" if action != "noise" else ("waiting" if locked_answer else "listening")
+            if utterance is None:
                 await send_turn_status(
-                    state="locked" if locked_answer else "listening",
-                    reason=reason,
-                    answer_stable=True,
-                    message="keeping current answer",
-                    confidence=confidence,
+                    state=turn_state,
+                    reason="listening",
+                    answer_stable=bool(locked_answer),
+                    message=(
+                        "listening for question…"
+                        if turn_state == "listening"
+                        else "armed — waiting for next question to finish"
+                    ),
                 )
-                if not final:
-                    trim_buffer()
+                trim_buffer(KEEP_AUDIO_SEC + 2)
                 return
 
-            # New interviewer question with enough confidence → unlock + regenerate once.
-            turn_state = "listening"
-            await send_turn_status(
-                state="processing",
-                reason="new_question",
-                answer_stable=False,
-                message="new question detected",
-                confidence=confidence,
+            await run_generate(
+                final=False,
+                reason="utterance" if turn_state == "listening" else "next_utterance",
+                audio=utterance,
             )
-            answer = await generate_live_answer(wav, question_hint=question)
-            if not answer:
-                # Keep previous stable answer if regeneration fails.
-                turn_state = "locked"
-                await send_turn_status(
-                    state="locked",
-                    reason="regen_failed",
-                    answer_stable=True,
-                    message="kept previous answer",
-                    confidence=confidence,
-                )
-            else:
-                await emit_answer(
-                    answer,
-                    final=final,
-                    reason="new_question",
-                    question=question,
-                )
-            if not final:
-                trim_buffer()
         except Exception:
             log.exception("ws process failed")
             await ws.send_json({"type": "error", "message": "processing failed"})
@@ -689,7 +632,13 @@ async def websocket_audio(ws: WebSocket):
             processing = False
 
     try:
-        await ws.send_json({"type": "ready", "features": ["turn_lock", "vad", "gate"]})
+        await ws.send_json(
+            {
+                "type": "ready",
+                "features": ["turn_lock", "vad", "silence_turn", "answer_now"],
+                "auto_answer": AUTO_ANSWER,
+            }
+        )
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -697,7 +646,6 @@ async def websocket_audio(ws: WebSocket):
 
             if message.get("bytes") is not None:
                 buffer.extend(message["bytes"])
-                # Cap memory (~45s PCM16 mono)
                 max_buf = SAMPLE_RATE * 2 * 45
                 if len(buffer) > max_buf:
                     del buffer[:-max_buf]
@@ -722,38 +670,28 @@ async def websocket_audio(ws: WebSocket):
                 turn_state = "listening"
                 locked_answer = None
                 last_question = None
-                locked_at = 0.0
                 await ws.send_json({"type": "started", "mode": mode, "state": "listening"})
             elif msg_type == "context":
                 context = data.get("context") or context
                 await ws.send_json({"type": "ok"})
             elif msg_type == "process":
                 await process_buffer(final=False, force=False)
-            elif msg_type == "unlock":
-                turn_state = "listening"
-                locked_answer = None
-                last_question = None
-                locked_at = 0.0
-                await send_turn_status(
-                    state="listening",
-                    reason="manual_unlock",
-                    answer_stable=False,
-                    message="unlocked — waiting for next question",
-                )
-            elif msg_type == "refresh":
-                # Force a new answer from current audio window.
+            elif msg_type in {"answer_now", "refresh"}:
+                # Reliable manual capture — does not require stopping the mic.
                 await process_buffer(final=False, force=True)
+            elif msg_type == "unlock":
+                turn_state = "armed" if locked_answer else "listening"
+                reset_after_lock()
+                await send_turn_status(
+                    state=turn_state,
+                    reason="manual_unlock",
+                    answer_stable=bool(locked_answer),
+                    message="unlocked — listening for next question",
+                )
             elif msg_type == "stop":
-                # On stop: do not burn tokens regenerating if already locked.
-                if locked_answer is None:
+                # Keep current answer; don't spend tokens on stop unless no answer yet.
+                if locked_answer is None and len(buffer) >= SAMPLE_RATE:
                     await process_buffer(final=True, force=True)
-                else:
-                    await send_turn_status(
-                        state="locked",
-                        reason="stopped",
-                        answer_stable=True,
-                        message="session mic stopped",
-                    )
                 await ws.send_json({"type": "stopped", "state": turn_state})
                 break
             else:
