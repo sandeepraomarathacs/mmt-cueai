@@ -18,6 +18,28 @@ function turnLabel(recording: boolean, busy: boolean, turnState: TurnState | str
   return 'listening · press Answer now after question'
 }
 
+function detectIsMac() {
+  const ua = navigator.userAgent || ''
+  const platform = navigator.platform || ''
+  return /Mac|iPhone|iPad|iPod/i.test(ua) || /Mac/i.test(platform)
+}
+
+type ShortcutRow = { action: string; win: string; mac: string }
+
+const SHORTCUTS: ShortcutRow[] = [
+  { action: 'Show / hide overlay', win: 'Ctrl + Shift + Space', mac: '⌘ + Shift + Space' },
+  { action: 'Toggle toolbar', win: 'Ctrl + Shift + T', mac: '⌘ + Shift + T' },
+  { action: 'Toggle history', win: 'Ctrl + Shift + H', mac: '⌘ + Shift + H' },
+  { action: 'Open ask box', win: 'Ctrl + Shift + A', mac: '⌘ + Shift + A' },
+  { action: 'Capture screen → AI', win: 'Ctrl + Shift + S', mac: '⌘ + Shift + S' },
+  { action: 'Live mic on / off', win: 'Ctrl + Shift + M', mac: '⌘ + Shift + M' },
+  { action: 'Answer now (from mic buffer)', win: 'Ctrl + Shift + G', mac: '⌘ + Shift + G' },
+  { action: 'Opacity up', win: 'Ctrl + Shift + ↑', mac: '⌘ + Shift + ↑' },
+  { action: 'Opacity down', win: 'Ctrl + Shift + ↓', mac: '⌘ + Shift + ↓' },
+  { action: 'Click-through on / off', win: 'Ctrl + Shift + C', mac: '⌘ + Shift + C' },
+  { action: 'Stealth (hide from screen share)', win: 'Ctrl + Shift + P', mac: '⌘ + Shift + P' },
+]
+
 function base64ToBlob(base64: string, mime = 'image/png'): Blob {
   const bin = atob(base64)
   const bytes = new Uint8Array(bin.length)
@@ -44,9 +66,12 @@ export default function LiveSessionPage() {
   const [turnState, setTurnState] = useState<TurnState | string>('listening')
   const [turnReason, setTurnReason] = useState('')
   const [turnMessage, setTurnMessage] = useState('')
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [isMac] = useState(() => detectIsMac())
   const liveAudioRef = useRef<LiveAudioSocket | null>(null)
   const askRef = useRef<HTMLTextAreaElement | null>(null)
   const lastSavedAnswerRef = useRef('')
+  const modLabel = isMac ? '⌘' : 'Ctrl'
 
   async function load() {
     const s = await api.getSession(sessionId)
@@ -235,14 +260,21 @@ export default function LiveSessionPage() {
           <div className="no-drag" style={{ display: 'flex', gap: 6 }}>
             <button
               className={`icon-btn ${showToolbar ? 'active' : ''}`}
-              title="Toolbar (Ctrl+Shift+T)"
+              title={`Toolbar (${modLabel}+Shift+T)`}
               onClick={() => setShowToolbar((v) => !v)}
             >
               ☰
             </button>
             <button
+              className={`icon-btn ${showShortcuts ? 'active' : ''}`}
+              title="Keyboard shortcuts"
+              onClick={() => setShowShortcuts((v) => !v)}
+            >
+              ?
+            </button>
+            <button
               className={`icon-btn ${showHistory ? 'active' : ''}`}
-              title="History (Ctrl+Shift+H)"
+              title={`History (${modLabel}+Shift+H)`}
               onClick={() => setShowHistory((v) => !v)}
             >
               H
@@ -329,7 +361,48 @@ export default function LiveSessionPage() {
               />
               <span className="muted">{Math.round(opacity * 100)}%</span>
             </div>
+            <button
+              className={`chip ${showShortcuts ? 'on' : ''}`}
+              onClick={() => setShowShortcuts((v) => !v)}
+              title="Show keyboard shortcuts"
+            >
+              Shortcuts
+            </button>
             <button className="chip danger" onClick={() => api.endSession(sessionId).then(load)}>End</button>
+          </div>
+        )}
+
+        {showShortcuts && (
+          <div className="shortcuts-panel no-drag">
+            <div className="shortcuts-head">
+              <div>
+                <strong>Keyboard shortcuts</strong>
+                <div className="muted">
+                  This device: {isMac ? 'Mac (⌘ Command)' : 'Windows (Ctrl)'} · both shown below
+                </div>
+              </div>
+              <button className="chip" onClick={() => setShowShortcuts(false)}>Close</button>
+            </div>
+            <div className="shortcuts-table">
+              <div className="shortcuts-row shortcuts-row-head">
+                <span>Action</span>
+                <span>Windows</span>
+                <span>Mac</span>
+              </div>
+              {SHORTCUTS.map((row) => (
+                <div
+                  key={row.action}
+                  className={`shortcuts-row ${isMac ? 'mac-active' : 'win-active'}`}
+                >
+                  <span>{row.action}</span>
+                  <kbd className={!isMac ? 'kbd-active' : ''}>{row.win}</kbd>
+                  <kbd className={isMac ? 'kbd-active' : ''}>{row.mac}</kbd>
+                </div>
+              ))}
+            </div>
+            <div className="muted" style={{ marginTop: 8 }}>
+              Tip: keep mic on, then press <kbd>{modLabel} + Shift + G</kbd> after each interviewer question.
+            </div>
           </div>
         )}
 
@@ -377,7 +450,9 @@ export default function LiveSessionPage() {
           {answer ? (
             <AnswerMarkdown content={answer} />
           ) : (
-            <div className="answer muted">Overlay ready. Use shortcuts or open toolbar.</div>
+            <div className="answer muted">
+              Overlay ready. Open toolbar or press <button className="linkish" type="button" onClick={() => setShowShortcuts(true)}>?</button> for shortcuts.
+            </div>
           )}
         </div>
 
@@ -420,7 +495,7 @@ export default function LiveSessionPage() {
         )}
 
         <DragRegion className="hint-bar">
-          Drag · Space hide · M mic · G answer now · S screen · T toolbar
+          {modLabel}+Shift: Space hide · M mic · G answer · S screen · T toolbar · ? keys
           {stealth ? ' · stealth ON' : ' · stealth OFF'}
           {clickThrough ? ' · click-through' : ''}
         </DragRegion>
