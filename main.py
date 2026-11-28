@@ -143,8 +143,9 @@ def system_prompt(mode: str, language: str, context: Optional[str] = None) -> st
     if context:
         parts.append(f"Session context / documents:\n{context[:8000]}")
     parts.append(
-        "If input is audio or a screen image, first understand what is being asked, "
-        "then answer. If no clear question is present, summarize useful talking points. "
+        "If input is audio or one or more screen images, first understand what is being asked "
+        "across all of them, then answer. Later screenshots can continue a scrolled page or show "
+        "another window. If no clear question is present, summarize useful talking points. "
         "Do not invent a new answer when the audio is only the candidate speaking an existing reply."
     )
     return "\n\n".join(parts)
@@ -210,6 +211,7 @@ async def gemini_generate(
     audio_mime: str = "audio/wav",
     image_bytes: Optional[bytes] = None,
     image_mime: str = "image/png",
+    images: Optional[List[Tuple[bytes, str]]] = None,
     model: Optional[str] = None,
     temperature: float = 0.4,
     max_output_tokens: Optional[int] = None,
@@ -220,7 +222,11 @@ async def gemini_generate(
 
     if audio_bytes:
         contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime))
-    if image_bytes:
+    if images:
+        for data, mime in images:
+            if data:
+                contents.append(types.Part.from_bytes(data=data, mime_type=mime))
+    elif image_bytes:
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
     contents.append(prompt)
 
@@ -340,6 +346,54 @@ async def ask_screen(
         system=system,
         image_bytes=raw,
         image_mime=mime,
+    )
+    return make_answer(answer, mode)
+
+
+SCREEN_BATCH_PROMPT = (
+    "These screenshots were taken in order during one capture. "
+    "The user may have scrolled, switched windows, or opened other apps between shots. "
+    "Read every image in order and treat them as one combined screen. "
+    "If a question, coding problem, or task appears anywhere, solve it using the full set."
+)
+
+
+@app.post("/ask/screens")
+async def ask_screens(
+    files: List[UploadFile] = File(...),
+    prompt: str = Form(""),
+    mode: str = Form("interview"),
+    language: str = Form("English"),
+    context: Optional[str] = Form(None),
+    session_id: Optional[int] = Form(None),
+):
+    images: List[Tuple[bytes, str]] = []
+    total = 0
+    for upload in files[:8]:
+        raw = await upload.read()
+        if not raw or len(raw) > 4 * 1024 * 1024:
+            continue
+        if total + len(raw) > 12 * 1024 * 1024:
+            break
+        total += len(raw)
+        mime = upload.content_type or "image/jpeg"
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        images.append((raw, mime))
+    if not images:
+        raise HTTPException(status_code=400, detail="Empty image")
+
+    log.info("ask/screens mode=%s images=%s bytes=%s", mode, len(images), total)
+    text = (prompt or "").strip()
+    if not text or text.startswith("What is on the screen?"):
+        text = SCREEN_BATCH_PROMPT
+    elif len(images) > 1:
+        text = f"{SCREEN_BATCH_PROMPT}\n\n{text}"
+    system = system_prompt(mode, language, context)
+    answer = await gemini_generate(
+        prompt=text[:4000],
+        system=system,
+        images=images,
     )
     return make_answer(answer, mode)
 
