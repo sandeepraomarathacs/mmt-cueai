@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('cueaiDesktop', {
   captureScreen: () => ipcRenderer.invoke('capture-screen'),
+  captureFrame: () => ipcRenderer.invoke('capture-frame'),
   setOpacity: (value) => ipcRenderer.invoke('set-opacity', value),
   getOpacity: () => ipcRenderer.invoke('get-opacity'),
   windowAction: (action) => ipcRenderer.invoke('window-action', action),

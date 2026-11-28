@@ -79,6 +79,15 @@ export const api = {
       body: form,
     })
   },
+  askScreens: async (id: number, files: Blob[], prompt?: string) => {
+    const form = new FormData()
+    files.forEach((file, i) => form.append('files[]', file, `screen-${i}.jpg`))
+    if (prompt) form.append('prompt', prompt)
+    return request<{ answer: string; message: Message }>(`/sessions/${id}/ask/screen`, {
+      method: 'POST',
+      body: form,
+    })
+  },
   realtimeConfig: () =>
     request<{ ws_url: string; chunk_process_seconds: number; sample_rate: number }>('/realtime-config'),
   storeMessage: (id: number, payload: { channel: string; input?: string; answer?: string; model?: string }) =>

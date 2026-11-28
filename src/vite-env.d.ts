@@ -10,6 +10,7 @@ interface ImportMeta {
 
 interface CueaiDesktop {
   captureScreen: () => Promise<string>
+  captureFrame: () => Promise<{ image: string; sig: string }>
   setOpacity: (value: number) => Promise<number>
   getOpacity: () => Promise<number>
   windowAction: (action: 'minimize' | 'hide' | 'close' | 'show') => Promise<void>

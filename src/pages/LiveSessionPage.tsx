@@ -18,7 +18,7 @@ const SHORTCUTS: ShortcutRow[] = [
   { action: 'Toggle toolbar', win: 'Ctrl + Shift + T', mac: '⌘ + Shift + T' },
   { action: 'Toggle history', win: 'Ctrl + Shift + H', mac: '⌘ + Shift + H' },
   { action: 'Open ask box', win: 'Ctrl + Shift + A', mac: '⌘ + Shift + A' },
-  { action: 'Capture screen → AI', win: 'Ctrl + Shift + S', mac: '⌘ + Shift + S' },
+  { action: 'Screen start / stop (same key)', win: 'Ctrl + Shift + S', mac: '⌘ + Shift + S' },
   { action: 'Mic start / stop (same key)', win: 'Ctrl + Shift + M', mac: '⌘ + Shift + M' },
   { action: 'Opacity up', win: 'Ctrl + Shift + ↑', mac: '⌘ + Shift + ↑' },
   { action: 'Opacity down', win: 'Ctrl + Shift + ↓', mac: '⌘ + Shift + ↓' },
@@ -33,6 +33,43 @@ function base64ToBlob(base64: string, mime = 'image/png'): Blob {
   return new Blob([bytes], { type: mime })
 }
 
+type ScreenShot = { image: string; sig: string }
+
+function sigDistance(a: string, b: string): number {
+  let x = ''
+  let y = ''
+  try {
+    x = atob(a)
+    y = atob(b)
+  } catch {
+    return 1
+  }
+  const n = Math.min(x.length, y.length)
+  if (!n) return 1
+  let diff = 0
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(x.charCodeAt(i) - y.charCodeAt(i)) > 18) diff++
+  }
+  return diff / n
+}
+
+function rememberShot(shots: ScreenShot[], shot: ScreenShot, max = 8) {
+  if (shots.length > 0 && sigDistance(shots[shots.length - 1].sig, shot.sig) < 0.06) return
+  shots.push(shot)
+  while (shots.length > max) {
+    let drop = 1
+    let best = Infinity
+    for (let i = 1; i < shots.length - 1; i++) {
+      const d = sigDistance(shots[i - 1].sig, shots[i].sig)
+      if (d < best) {
+        best = d
+        drop = i
+      }
+    }
+    shots.splice(drop, 1)
+  }
+}
+
 export default function LiveSessionPage() {
   const { id } = useParams()
   const sessionId = Number(id)
@@ -43,6 +80,8 @@ export default function LiveSessionPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [recording, setRecording] = useState(false)
+  const [capturing, setCapturing] = useState(false)
+  const [screenFrames, setScreenFrames] = useState(0)
   const [statusText, setStatusText] = useState('ready')
   const [showToolbar, setShowToolbar] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
@@ -55,6 +94,10 @@ export default function LiveSessionPage() {
   const liveAudioRef = useRef<LiveAudioSocket | null>(null)
   const askRef = useRef<HTMLTextAreaElement | null>(null)
   const lastSavedAnswerRef = useRef('')
+  const shotsRef = useRef<ScreenShot[]>([])
+  const captureTokenRef = useRef(0)
+  const captureTimerRef = useRef<number | null>(null)
+  const captureInflightRef = useRef<Promise<void> | null>(null)
   const modLabel = isMac ? '⌘' : 'Ctrl'
 
   async function load() {
@@ -77,24 +120,77 @@ export default function LiveSessionPage() {
       .catch(() => {})
   }, [])
 
-  const captureScreen = useCallback(async () => {
-    setBusy(true)
-    setError('')
-    try {
-      if (!window.cueaiDesktop?.captureScreen) {
-        throw new Error('Desktop capture bridge unavailable')
-      }
-      const base64 = await window.cueaiDesktop.captureScreen()
-      const blob = base64ToBlob(base64)
-      const res = await api.askScreen(sessionId, blob)
-      setAnswer(res.answer || '')
-      setMessages((prev) => [res.message, ...prev])
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Screen capture failed')
-    } finally {
-      setBusy(false)
+  const grabFrame = useCallback(async () => {
+    if (!window.cueaiDesktop?.captureFrame) {
+      throw new Error('Restart the desktop app so screen capture can collect multiple frames.')
     }
-  }, [sessionId])
+    const frame = await window.cueaiDesktop.captureFrame()
+    if (!frame?.image) return
+    rememberShot(shotsRef.current, frame)
+    setScreenFrames(shotsRef.current.length)
+  }, [])
+
+  const toggleScreen = useCallback(async () => {
+    if (capturing) {
+      captureTokenRef.current += 1
+      if (captureTimerRef.current != null) {
+        window.clearTimeout(captureTimerRef.current)
+        captureTimerRef.current = null
+      }
+      if (captureInflightRef.current) await captureInflightRef.current
+      const shots = shotsRef.current.splice(0)
+      setCapturing(false)
+      setScreenFrames(0)
+      if (!shots.length) {
+        setError('No screen captured')
+        setStatusText(recording ? 'recording…' : 'ready')
+        return
+      }
+      setBusy(true)
+      setError('')
+      setStatusText('thinking…')
+      try {
+        const blobs = shots.map((shot) => base64ToBlob(shot.image, 'image/jpeg'))
+        const res = await api.askScreens(sessionId, blobs)
+        setAnswer(res.answer || '')
+        setMessages((prev) => [res.message, ...prev])
+        setStatusText(recording ? 'recording…' : 'answer ready')
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Screen capture failed')
+        setStatusText(recording ? 'recording…' : 'ready')
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
+
+    if (!window.cueaiDesktop?.captureFrame) {
+      setError('Restart the desktop app so screen capture can collect multiple frames.')
+      return
+    }
+
+    shotsRef.current = []
+    setScreenFrames(0)
+    setError('')
+    setCapturing(true)
+    setStatusText('capturing screen…')
+    const token = captureTokenRef.current
+
+    const tick = async () => {
+      if (captureTokenRef.current !== token) return
+      const job = grabFrame().catch((err) => {
+        setError(err instanceof Error ? err.message : 'Screen grab failed')
+      })
+      captureInflightRef.current = job
+      await job
+      if (captureInflightRef.current === job) captureInflightRef.current = null
+      if (captureTokenRef.current !== token) return
+      captureTimerRef.current = window.setTimeout(() => {
+        void tick()
+      }, 800)
+    }
+    void tick()
+  }, [capturing, grabFrame, recording, sessionId])
 
   const toggleMic = useCallback(async () => {
     // STOP -> answer from this recording (answer stays on screen)
@@ -165,6 +261,8 @@ export default function LiveSessionPage() {
   }, [recording, session?.mode, sessionId])
 
   useEffect(() => () => {
+    captureTokenRef.current += 1
+    if (captureTimerRef.current != null) window.clearTimeout(captureTimerRef.current)
     void liveAudioRef.current?.stop(false)
   }, [])
 
@@ -180,7 +278,7 @@ export default function LiveSessionPage() {
         setShowToolbar(true)
         setTimeout(() => askRef.current?.focus(), 50)
       }
-      if (payload.action === 'capture-screen') void captureScreen()
+      if (payload.action === 'capture-screen') void toggleScreen()
       if (payload.action === 'toggle-mic') void toggleMic()
     })
     const offOpacity = desktop.onOpacity((payload) => setOpacity(payload.value))
@@ -193,7 +291,7 @@ export default function LiveSessionPage() {
       offClick()
       offStealth?.()
     }
-  }, [captureScreen, toggleMic])
+  }, [toggleScreen, toggleMic])
 
   async function askText(e: FormEvent) {
     e.preventDefault()
@@ -224,7 +322,7 @@ export default function LiveSessionPage() {
           <div style={{ minWidth: 0 }}>
             <h1>{session?.title || 'Live session'}</h1>
             <div className="muted">
-              {session?.mode} · {busy && !recording ? 'working…' : statusText}
+              {session?.mode} · {capturing ? `capturing screen… ${screenFrames}` : busy && !recording ? 'working…' : statusText}
             </div>
           </div>
           <div className="no-drag" style={{ display: 'flex', gap: 6 }}>
@@ -277,7 +375,14 @@ export default function LiveSessionPage() {
             >
               {recording ? 'Stop mic → answer' : 'Start mic'}
             </button>
-            <button className="chip" onClick={() => void captureScreen()} disabled={busy}>Screen</button>
+            <button
+              className={`chip ${capturing ? 'on' : ''}`}
+              onClick={() => void toggleScreen()}
+              disabled={busy && !capturing}
+              title={`${modLabel}+Shift+S`}
+            >
+              {capturing ? `Stop screen → answer (${screenFrames})` : 'Start screen'}
+            </button>
             <button className={`chip ${showAsk ? 'on' : ''}`} onClick={() => setShowAsk((v) => !v)}>Ask</button>
             <button
               className={`chip ${stealth ? 'on' : ''}`}
@@ -339,7 +444,9 @@ export default function LiveSessionPage() {
               ))}
             </div>
             <div className="muted" style={{ marginTop: 8 }}>
-              Flow: Start mic → talk → Stop mic → answer appears and stays.
+              Flow: Start mic → talk → Stop mic → answer stays.
+              <br />
+              Screen: Start screen → scroll or open other windows → Stop screen → one answer.
             </div>
           </div>
         )}
@@ -351,9 +458,11 @@ export default function LiveSessionPage() {
             <AnswerMarkdown content={answer} />
           ) : (
             <div className="answer muted">
-              {recording
+              {capturing
+                ? `Capturing… ${screenFrames} frame${screenFrames === 1 ? '' : 's'}. Scroll or open other windows, then press Stop screen (${modLabel}+Shift+S).`
+                : recording
                 ? 'Recording… press Stop mic (same key) when the question/segment is done.'
-                : <>Ready. Press Start mic ({modLabel}+Shift+M). Stop mic to get the answer. <button className="linkish" type="button" onClick={() => setShowShortcuts(true)}>?</button></>}
+                : <>Ready. Mic {modLabel}+Shift+M. Screen {modLabel}+Shift+S — start, scroll or switch windows, press the same key to stop. <button className="linkish" type="button" onClick={() => setShowShortcuts(true)}>?</button></>}
             </div>
           )}
         </div>
@@ -395,9 +504,11 @@ export default function LiveSessionPage() {
         )}
 
         <DragRegion className="hint-bar">
-          {recording
-            ? `${modLabel}+Shift+M stop → answer`
-            : `${modLabel}+Shift+M start/stop mic · answer stays on screen`}
+          {capturing
+            ? `${modLabel}+Shift+S stop → answer (${screenFrames})`
+            : recording
+              ? `${modLabel}+Shift+M stop → answer`
+              : `${modLabel}+Shift+M mic · ${modLabel}+Shift+S screen · same key stops`}
           {stealth ? ' · stealth ON' : ''}
         </DragRegion>
       </div>

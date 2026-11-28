@@ -221,18 +221,48 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin' && isQuitting) app.quit()
 })
 
-ipcMain.handle('capture-screen', async () => {
-  // Ensure our overlay stays excluded while we snapshot the display
+function frameSignature(image) {
+  const tiny = image.resize({ width: 64, height: 36, quality: 'good' })
+  const buf = tiny.toBitmap()
+  const pixels = Math.min(64 * 36, Math.floor(buf.length / 4))
+  const gray = Buffer.alloc(pixels)
+  for (let i = 0; i < pixels; i++) {
+    const o = i * 4
+    gray[i] = Math.round((buf[o + 2] * 3 + buf[o + 1] * 6 + buf[o]) / 10)
+  }
+  return gray.toString('base64')
+}
+
+async function grabDisplayFrame() {
   applyCaptureExclusion()
-  const primary = screen.getPrimaryDisplay()
-  const { width, height } = primary.size
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+  const scale = display.scaleFactor || 1
+  const srcW = Math.max(1, Math.round(display.size.width * scale))
+  const srcH = Math.max(1, Math.round(display.size.height * scale))
+  const ratio = Math.min(1, 1600 / srcW)
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: { width, height },
+    thumbnailSize: {
+      width: Math.max(1, Math.round(srcW * ratio)),
+      height: Math.max(1, Math.round(srcH * ratio)),
+    },
   })
-  const source = sources[0]
-  if (!source) throw new Error('No screen source')
-  return source.thumbnail.toPNG().toString('base64')
+  const source = sources.find((s) => String(s.display_id) === String(display.id)) || sources[0]
+  if (!source || source.thumbnail.isEmpty()) throw new Error('No screen source')
+  return source.thumbnail
+}
+
+ipcMain.handle('capture-screen', async () => {
+  const image = await grabDisplayFrame()
+  return image.toPNG().toString('base64')
+})
+
+ipcMain.handle('capture-frame', async () => {
+  const image = await grabDisplayFrame()
+  return {
+    image: image.toJPEG(78).toString('base64'),
+    sig: frameSignature(image),
+  }
 })
 
 ipcMain.handle('set-opacity', (_e, value) => {
