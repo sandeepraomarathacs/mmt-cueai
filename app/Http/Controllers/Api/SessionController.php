@@ -179,22 +179,49 @@ class SessionController extends Controller
         $this->authorizeSession($request, $session);
 
         $request->validate([
-            'file' => ['required', 'file', 'image'],
+            'file' => ['required_without:files', 'file', 'image'],
+            'files' => ['required_without:file', 'array', 'min:1', 'max:8'],
+            'files.*' => ['file', 'image', 'max:6144'],
             'prompt' => ['nullable', 'string'],
         ]);
 
         [$pythonUrl, $apiKey] = $this->pythonConnection();
 
-        $response = Http::timeout(180)
-            ->withHeaders(['X-API-Key' => $apiKey])
-            ->attach('file', file_get_contents($request->file('file')->getRealPath()), $request->file('file')->getClientOriginalName())
-            ->post("{$pythonUrl}/ask/screen", [
-                'prompt' => $request->input('prompt', 'What is on the screen? If there is a question or coding problem, solve it.'),
+        $uploads = $request->file('files', []);
+        if (!is_array($uploads)) {
+            $uploads = $uploads ? [$uploads] : [];
+        }
+
+        if (count($uploads) > 0) {
+            $pending = Http::timeout(180)->withHeaders(['X-API-Key' => $apiKey]);
+            foreach (array_values($uploads) as $index => $upload) {
+                $pending = $pending->attach(
+                    'files',
+                    file_get_contents($upload->getRealPath()),
+                    'screen-'.$index.'.jpg'
+                );
+            }
+            $response = $pending->post("{$pythonUrl}/ask/screens", [
+                'prompt' => $request->input('prompt', ''),
                 'mode' => $session->mode,
                 'language' => $session->language,
                 'context' => $session->context,
                 'session_id' => (string) $session->id,
             ]);
+            $screenInput = '[screen '.count($uploads).' frames]';
+        } else {
+            $response = Http::timeout(180)
+                ->withHeaders(['X-API-Key' => $apiKey])
+                ->attach('file', file_get_contents($request->file('file')->getRealPath()), $request->file('file')->getClientOriginalName())
+                ->post("{$pythonUrl}/ask/screen", [
+                    'prompt' => $request->input('prompt', 'What is on the screen? If there is a question or coding problem, solve it.'),
+                    'mode' => $session->mode,
+                    'language' => $session->language,
+                    'context' => $session->context,
+                    'session_id' => (string) $session->id,
+                ]);
+            $screenInput = $request->input('prompt');
+        }
 
         if (!$response->successful()) {
             return response()->json([
@@ -207,7 +234,7 @@ class SessionController extends Controller
         $message = AiMessage::create([
             'ai_session_id' => $session->id,
             'channel' => 'screen',
-            'input' => $request->input('prompt'),
+            'input' => $screenInput,
             'answer' => $payload['answer'] ?? null,
             'model' => $payload['model'] ?? null,
             'meta' => $payload,
